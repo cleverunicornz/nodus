@@ -395,8 +395,26 @@ export function stripUnpublishableColumns(row: Record<string, unknown>): Record<
   );
 }
 
+const CURRENT_PROFILE_VERSION_TABLES: Record<string, true> = {
+  document_profile_versions: true,
+  document_profile_fields: true,
+  document_sections: true,
+  document_profile_support: true,
+  document_vectors: true,
+  document_idea_links: true,
+};
+
 function readTable(db: Database.Database, table: string): Record<string, unknown>[] {
-  return (db.prepare(`SELECT * FROM "${table.replace(/"/g, '""')}"`).all() as Record<string, unknown>[]).map((row) =>
+  const escaped = table.replace(/"/g, '""');
+  const rows = CURRENT_PROFILE_VERSION_TABLES[table]
+    ? db.prepare(
+      `SELECT profile_row.* FROM "${escaped}" profile_row
+       JOIN document_profile_state profile_state
+         ON profile_state.nodus_id=profile_row.nodus_id
+        AND profile_state.current_version_id=profile_row.version_id`
+    ).all()
+    : db.prepare(`SELECT * FROM "${escaped}"`).all();
+  return (rows as Record<string, unknown>[]).map((row) =>
     Object.fromEntries(Object.entries(row).flatMap(([column, value]) => {
       const safe = safeValue(column, value);
       return safe === undefined ? [] : [[column, safe]];

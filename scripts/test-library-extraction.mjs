@@ -188,6 +188,9 @@ try {
   assert.equal(quality.doubleSpaces, 0);
   assert.equal(quality.softHyphens, 0);
   assert.equal(quality.brokenWordLineWraps, 0);
+  assert.equal(quality.controlCharactersReplaced, 0);
+  assert.equal(quality.preexistingReplacementCharacters, 0);
+  assert.deepEqual(quality.controlReplacementPages, []);
   assert.equal(quality.footnoteReferences, 2);
   assert.equal(quality.footnoteDefinitions, 2);
   assert.equal(quality.unresolvedFootnotes, 0);

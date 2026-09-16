@@ -54,6 +54,7 @@ try {
 
   const repo = require(path.join(repoRoot, 'electron/db/documentProfilesRepo.ts'));
   const profileAi = require(path.join(repoRoot, 'electron/ai/documentProfile.ts'));
+  const passagesRepo = require(path.join(repoRoot, 'electron/db/passagesRepo.ts'));
   assert.deepEqual(profileAi.normalizeSectionAnalysis({
     section_analysis: {
       title: 'Método', summary: 'Describe el entrenamiento.', role: 'method',
@@ -87,12 +88,13 @@ try {
   const sectionId = 'section-intro';
   const supportId = 'support-thesis';
   sqlite.prepare(`INSERT INTO passages(
-    passage_id,nodus_id,chunk_index,text,page_label,char_len,content_hash,created_at
-  ) VALUES('w1#0','w1',0,'El proceso avanzó de manera desigual.','p. 4',37,'source-1',?)`).run(new Date().toISOString());
+    passage_id,nodus_id,chunk_index,text,page_label,source_ref,page_number,char_len,content_hash,created_at
+  ) VALUES('w1#0','w1',0,'El proceso avanzó de manera desigual.','p. 4','zotero:user:0:ATTACH',4,37,'source-1',?)`).run(new Date().toISOString());
   const versionId = repo.publishDocumentProfile({
     nodusId: 'w1', sourceFingerprint: 'source-1', pipelineVersion: 'document-profile/1', schemaVersion: 1,
     sourceLanguage: 'es', presentationLanguage: 'es', overview: 'Estudia la modernización española.',
     profile: { thesis: 'La modernización fue desigual.' },
+    resolvedText: 'El proceso avanzó de manera desigual.',
     fields: [{ fieldId, kind: 'thesis', ordinal: 0, text: 'La modernización fue desigual.', confidence: 0.96, centrality: 1 }],
     sections: [{
       sectionId, parentSectionId: null, level: 1, ordinal: 0, title: 'Introducción', role: 'planteamiento',
@@ -105,6 +107,7 @@ try {
       supportId, targetKind: 'field', targetId: fieldId, sectionId, passageId: 'w1#0',
       pageStart: 'p. 4', pageEnd: 'p. 4', quote: 'El proceso avanzó de manera desigual.',
       sourceRef: 'zotero:user:0:ATTACH', pageStartNumber: 4, pageEndNumber: 4,
+      charStart: 0, charEnd: 37,
       supportKind: 'direct', confidence: 0.97, validationStatus: 'valid',
     }],
     ideaLinks: [], vectors: [], generatorModel: null, auditorModel: null,
@@ -115,23 +118,73 @@ try {
   const profile = repo.getDocumentProfile('w1');
   assert.equal(profile.versionId, versionId);
   assert.equal(profile.fields[0].text, 'La modernización fue desigual.');
-  assert.equal(profile.sections[0].sectionId, sectionId);
+  assert.equal(profile.fields[0].fieldId, `${versionId}:field:${fieldId}`);
+  assert.equal(profile.sections[0].sectionId, `${versionId}:section:${sectionId}`);
   assert.equal(profile.sections[0].sourceRef, 'zotero:user:0:ATTACH');
   assert.equal(profile.sections[0].pageStartNumber, 1);
+  assert.equal(profile.supports[0].targetId, profile.fields[0].fieldId);
+  assert.equal(profile.supports[0].sectionId, profile.sections[0].sectionId);
   assert.equal(profile.supports[0].validationStatus, 'valid');
   assert.equal(profile.supports[0].sourceRef, 'zotero:user:0:ATTACH');
   assert.equal(profile.supports[0].pageStartNumber, 4);
+  assert.equal(profile.supports[0].charStart, 0);
+  assert.equal(profile.supports[0].charEnd, 37);
   const exactSupport = repo.findDocumentSupportPassages([{
     kind: 'document', nodusId: 'w1', title: 'Modernización española', authors: ['Autora Uno'], year: 2024,
-    versionId, sourceId: fieldId, fieldKind: 'thesis', text: 'La modernización fue desigual.', similarity: 0.8,
+    versionId, sourceId: profile.fields[0].fieldId, fieldKind: 'thesis', text: 'La modernización fue desigual.', similarity: 0.8,
     centrality: 1, explanation: 'Coincidencia en tesis', stale: false,
   }], 5);
   assert.equal(exactSupport[0].passage_id, 'w1#0', 'a matched profile field follows its validated support to the original passage');
   assert.equal(exactSupport[0].similarity, 0.776);
+  assert.equal(exactSupport[0].source_ref, 'zotero:user:0:ATTACH');
+  assert.equal(exactSupport[0].page_number, 4);
+  sqlite.prepare(`INSERT INTO passages(
+    passage_id,nodus_id,chunk_index,text,page_label,source_ref,page_number,char_len,content_hash,created_at
+  ) VALUES('w1#1','w1',1,'Texto relacionado sin la cita literal.','p. 4','zotero:user:0:ATTACH',4,36,'source-1',?)`)
+    .run(new Date().toISOString());
+  sqlite.prepare('UPDATE document_profile_support SET passage_id=? WHERE version_id=?').run('w1#1', versionId);
+  assert.equal(repo.findDocumentSupportPassages([{
+    kind: 'document', nodusId: 'w1', title: 'Modernización española', authors: ['Autora Uno'], year: 2024,
+    versionId, sourceId: profile.fields[0].fieldId, fieldKind: 'thesis', text: 'La modernización fue desigual.', similarity: 0.8,
+    centrality: 1, explanation: 'Coincidencia en tesis', stale: false,
+  }], 5).length, 0, 'legacy invalid support links are excluded from the exact-support lane');
+  sqlite.prepare('UPDATE document_profile_support SET passage_id=? WHERE version_id=?').run('w1#0', versionId);
+  sqlite.prepare("DELETE FROM passages WHERE passage_id='w1#1'").run();
+  const currentBeforeInvalidSupport = repo.getDocumentProfile('w1').versionId;
+  assert.throws(() => repo.publishDocumentProfile({
+    nodusId: 'w1', sourceFingerprint: 'bad-support-source', pipelineVersion: 'document-profile/test', schemaVersion: 2,
+    sourceLanguage: 'es', presentationLanguage: 'es', overview: 'Candidato con enlace incorrecto.',
+    profile: {}, resolvedText: 'Literal evidence.',
+    fields: [{ fieldId: 'bad-field', kind: 'thesis', ordinal: 0, text: 'Claim', confidence: 1, centrality: 1 }],
+    sections: [],
+    supports: [{
+      supportId: 'bad-support', targetKind: 'field', targetId: 'bad-field', sectionId: null,
+      passageId: 'w1#0', pageStart: null, pageEnd: null, sourceRef: 'zotero:user:0:ATTACH',
+      pageStartNumber: null, pageEndNumber: null, charStart: 0, charEnd: 17,
+      quote: 'Literal evidence.', supportKind: 'direct', confidence: 1, validationStatus: 'valid',
+    }],
+    passages: {
+      contentHash: 'bad-support-source',
+      rows: [{ text: 'Related but different.', pageLabel: 'p. 1', sourceRef: 'zotero:user:0:ATTACH', pageNumber: 1, embedding: null }],
+    },
+    ideaLinks: [], vectors: [], generatorModel: null, auditorModel: null, promptHash: 'bad-support',
+    audit: { passed: true, score: 1, supportCoverage: 1, structureCoverage: 1, issues: [], repaired: false },
+    qualityScore: 1,
+  }), /no ancla literalmente/);
+  assert.equal(repo.getDocumentProfile('w1').versionId, currentBeforeInvalidSupport,
+    'an invalid passage edge is rejected before it can replace the current profile');
+
+  passagesRepo.replaceWorkPassages('w1', 'source-1', [{
+    text: 'El proceso avanzó de manera desigual.', pageLabel: 'p. 4',
+    sourceRef: 'zotero:user:0:ATTACH', pageNumber: 4, embedding: null,
+  }]);
+  assert.equal(sqlite.prepare(
+    'SELECT passage_id FROM document_profile_support WHERE version_id=?'
+  ).get(versionId).passage_id, null, 'passage replacement detaches links before recycling stable chunk ids');
   sqlite.prepare("UPDATE works SET resolved_text_hash='replacement-source' WHERE nodus_id='w1'").run();
   assert.equal(repo.findDocumentSupportPassages([{
     kind: 'document', nodusId: 'w1', title: 'Modernización española', authors: ['Autora Uno'], year: 2024,
-    versionId, sourceId: fieldId, fieldKind: 'thesis', text: 'La modernización fue desigual.', similarity: 0.8,
+    versionId, sourceId: profile.fields[0].fieldId, fieldKind: 'thesis', text: 'La modernización fue desigual.', similarity: 0.8,
     centrality: 1, explanation: 'Coincidencia en tesis', stale: true,
   }], 5).length, 0, 'profile support never revives a passage from a replaced text');
   sqlite.prepare("UPDATE works SET resolved_text_hash=NULL WHERE nodus_id='w1'").run();
@@ -171,14 +224,83 @@ try {
   assert.equal(preserved.overviewConflict, true);
   assert.equal(repo.lexicalDocumentSearch('investigadora', 5)[0].nodusId, 'w1', 'search uses the corrected profile text');
 
+  const partialVersionId = repo.publishDocumentProfile({
+    nodusId: 'w1', sourceFingerprint: 'source-3', pipelineVersion: 'document-profile/1', schemaVersion: 1,
+    sourceLanguage: 'es', presentationLanguage: 'es', overview: 'Síntesis conservada con cautela.',
+    profile: { thesis: 'Síntesis conservada con cautela.', fallbackMode: 'partial' },
+    resolvedText: 'El proceso avanzó de manera desigual.',
+    fields: [{ fieldId: 'field-thesis-v2', kind: 'thesis', ordinal: 0, text: 'Nueva tesis generada.', confidence: 0.91, centrality: 1 }],
+    sections: [{
+      sectionId, parentSectionId: null, level: 1, ordinal: 0, title: 'Introducción', role: 'planteamiento',
+      summary: 'Presenta una modernización territorialmente desigual.', concepts: ['modernización'],
+      claims: ['La modernización fue desigual.'], pageStart: 'p. 1', pageEnd: 'p. 12',
+      sourceRef: 'zotero:user:0:ATTACH', pageStartNumber: 1, pageEndNumber: 12,
+      charStart: 0, charEnd: 1200, contentHash: 'section-hash',
+    }],
+    supports: [{
+      supportId, targetKind: 'field', targetId: 'field-thesis-v2', sectionId, passageId: 'w1#0',
+      pageStart: 'p. 4', pageEnd: 'p. 4', quote: 'El proceso avanzó de manera desigual.',
+      sourceRef: 'zotero:user:0:ATTACH', pageStartNumber: 4, pageEndNumber: 4,
+      charStart: 0, charEnd: 37,
+      supportKind: 'direct', confidence: 0.97, validationStatus: 'valid',
+    }],
+    ideaLinks: [],
+    vectors: [
+      { vectorId: 'field-vector', kind: 'thesis', sourceId: 'field-thesis-v2', text: 'Nueva tesis generada.', weight: 1, embedding: null },
+      { vectorId: 'section-vector', kind: 'section', sourceId: sectionId, text: 'Introducción', weight: 0.75, embedding: null },
+    ],
+    generatorModel: null, auditorModel: null, promptHash: 'prompt-v3',
+    audit: { passed: false, score: 0.79, supportCoverage: 1, structureCoverage: 1, issues: ['cautela'], repaired: true, fallback: 'partial' },
+    qualityScore: 0.79,
+  });
+  const partial = repo.getDocumentProfile('w1');
+  assert.equal(partial.versionId, partialVersionId);
+  assert.equal(partial.audit.passed, false, 'semantic rejection is preserved');
+  assert.equal(partial.audit.fallback, 'partial', 'the deterministic publication mode is explicit');
+  assert.equal(partial.fields[0].fieldId, `${partialVersionId}:field:field-thesis-v2`);
+  assert.equal(partial.sections[0].sectionId, `${partialVersionId}:section:${sectionId}`);
+  assert.equal(partial.supports[0].targetId, partial.fields[0].fieldId);
+  assert.equal(partial.supports[0].sectionId, partial.sections[0].sectionId);
+  assert.deepEqual(
+    sqlite.prepare('SELECT kind,source_id FROM document_vectors WHERE version_id=? ORDER BY kind').all(partialVersionId),
+    [
+      { kind: 'section', source_id: partial.sections[0].sectionId },
+      { kind: 'thesis', source_id: partial.fields[0].fieldId },
+    ],
+    'vectors reference the ids materialized for their own version',
+  );
+  assert.equal(sqlite.prepare(
+    'SELECT COUNT(*) n FROM document_profile_fields WHERE field_id IN (?,?)'
+  ).get(`${nextVersionId}:field:field-thesis-v2`, `${partialVersionId}:field:field-thesis-v2`).n, 2,
+  'the same logical field survives in both retained versions');
+  assert.equal(sqlite.prepare(
+    'SELECT COUNT(*) n FROM document_sections WHERE section_id IN (?,?)'
+  ).get(`${versionId}:section:${sectionId}`, `${partialVersionId}:section:${sectionId}`).n, 2,
+  'the same logical section survives in both retained versions');
+  assert.equal(repo.findDocumentSupportPassages([{
+    kind: 'document', nodusId: 'w1', title: 'Modernización española', authors: ['Autora Uno'], year: 2024,
+    versionId, sourceId: profile.fields[0].fieldId, fieldKind: 'thesis', text: 'Historical thesis', similarity: 0.8,
+    centrality: 1, explanation: 'Historical hit', stale: true,
+  }], 5).length, 0, 'superseded support cannot bind to a replacement current passage id');
+
   assert.throws(() => repo.publishDocumentProfile({
     nodusId: 'w1', sourceFingerprint: 'source-2', pipelineVersion: 'document-profile/1', schemaVersion: 1,
     sourceLanguage: 'es', presentationLanguage: 'es', overview: 'Candidato inválido', profile: {},
     fields: [], sections: [], supports: [], vectors: [], generatorModel: null, auditorModel: null,
     promptHash: 'prompt-2', audit: { passed: false, score: 0.2, supportCoverage: 0, structureCoverage: 0, issues: ['sin apoyo'], repaired: false },
     qualityScore: 0.2,
-  }), /auditoría/);
-  assert.equal(repo.getDocumentProfile('w1').versionId, nextVersionId, 'failed candidate cannot replace current profile');
+  }), /contrato de publicación/);
+  assert.equal(repo.getDocumentProfile('w1').versionId, partialVersionId, 'failed candidate cannot replace current profile');
+  repo.setDocumentProfileState('w1', 'failed', { error: 'refresh failed after publication' });
+  repo.restoreDocumentProfileStateAfterFailure('w1', 'refresh failed after publication', 'source-3');
+  assert.equal(repo.documentProfileStatuses(['w1'])[0].status, 'current',
+    'a failed refresh of the same source leaves the committed profile current');
+  assert.equal(repo.documentProfileStatuses(['w1'])[0].error, 'refresh failed after publication',
+    'the failed refresh remains visible while the prior profile stays readable');
+  repo.restoreDocumentProfileStateAfterFailure('w1', 'replacement source failed', 'different-source');
+  assert.equal(repo.documentProfileStatuses(['w1'])[0].status, 'stale',
+    'a failed refresh that read different source bytes leaves the prior profile stale');
+  repo.setDocumentProfileState('w1', 'current', { staleReason: null, error: null });
   assert.equal(repo.listDocumentIndexCampaigns()[0].status, 'completed');
 
   sqlite.prepare("UPDATE works SET title='Modernización española en el siglo XX' WHERE nodus_id='w1'").run();
@@ -207,6 +329,10 @@ try {
   assert.equal(repo.documentProfileStatuses(['w2'])[0].status, 'queued');
   repo.cancelDocumentIndexJob(missingJob.jobId);
   assert.equal(repo.documentProfileStatuses(['w2'])[0].status, 'missing', 'cancelling a job restores a work without a profile to missing');
+  repo.restoreDocumentProfileStateAfterFailure('w2', 'first publication failed', null);
+  assert.equal(repo.documentProfileStatuses(['w2'])[0].status, 'failed',
+    'a first publication failure remains visible when no profile exists');
+  assert.equal(repo.documentProfileStatuses(['w2'])[0].error, 'first publication failed');
 
   const staleCampaign = repo.createDocumentIndexCampaign({
     vaultId: 'vault-a', mode: 'manual', includeArchived: false,
@@ -364,7 +490,8 @@ try {
   };
   const firstReplayVersion = repo.publishDocumentProfile(replayInput);
   assert.deepEqual(
-    sqlite.prepare("SELECT embedding_provider provider,embedding_model model FROM document_vectors WHERE vector_id='captured-vector'").get(),
+    sqlite.prepare('SELECT embedding_provider provider,embedding_model model FROM document_vectors WHERE vector_id=?')
+      .get(`${nextVersionId}:vector:captured-vector`),
     { provider: 'captured-provider', model: 'captured-model' },
     'publication records the embedding configuration captured when the vector was generated',
   );
@@ -382,14 +509,23 @@ try {
     1,
     'crash replay cannot create a duplicate superseded version',
   );
+  const changedAuditVersion = repo.publishDocumentProfile({
+    ...replayInput,
+    audit: { ...replayInput.audit, score: 0.9, issues: ['new semantic reading'] },
+    qualityScore: 0.9,
+  });
+  assert.notEqual(changedAuditVersion, firstReplayVersion,
+    'a changed audit is a new publication payload even when prose is identical');
+  assert.equal(sqlite.prepare("SELECT COUNT(*) n FROM document_profile_versions WHERE nodus_id='w3'").get().n, 2);
   const invalidAtomicCandidate = {
     ...replayInput,
     sourceFingerprint: 'candidate-source',
     profile: { thesis: 'Candidato que debe revertirse.' },
     fields: [{ fieldId: 'candidate-field', kind: 'thesis', ordinal: 0, text: 'Candidato.', confidence: 1, centrality: 1 }],
+    resolvedText: 'Pasaje candidato.',
     supports: [
-      { supportId: 'duplicate-support', targetKind: 'field', targetId: 'candidate-field', sectionId: null, passageId: 'w3#0', pageStart: null, pageEnd: null, quote: 'Pasaje candidato.', supportKind: 'direct', confidence: 1, validationStatus: 'valid' },
-      { supportId: 'duplicate-support', targetKind: 'field', targetId: 'candidate-field', sectionId: null, passageId: 'w3#0', pageStart: null, pageEnd: null, quote: 'Pasaje candidato.', supportKind: 'direct', confidence: 1, validationStatus: 'valid' },
+      { supportId: 'duplicate-support', targetKind: 'field', targetId: 'candidate-field', sectionId: null, passageId: 'w3#0', pageStart: null, pageEnd: null, charStart: 0, charEnd: 17, quote: 'Pasaje candidato.', supportKind: 'direct', confidence: 1, validationStatus: 'valid' },
+      { supportId: 'duplicate-support', targetKind: 'field', targetId: 'candidate-field', sectionId: null, passageId: 'w3#0', pageStart: null, pageEnd: null, charStart: 0, charEnd: 17, quote: 'Pasaje candidato.', supportKind: 'direct', confidence: 1, validationStatus: 'valid' },
     ],
     passages: { contentHash: 'candidate-passages', rows: [{ text: 'Pasaje candidato.', pageLabel: 'p. 2', embedding: null }] },
   };
@@ -399,12 +535,32 @@ try {
     'Pasaje estable anterior.',
     'a failed late publication rolls back the staged passage replacement too',
   );
+  const invalidFtsCandidate = {
+    ...replayInput,
+    sourceFingerprint: 'fts-candidate-source',
+    profile: { thesis: 'Candidate whose FTS projection must fail atomically.' },
+    sections: [{
+      sectionId: 'fts-section', parentSectionId: null, level: 1, ordinal: 0, title: 'Broken FTS',
+      role: null, summary: 'Summary', concepts: null, claims: [], pageStart: null, pageEnd: null,
+      charStart: 0, charEnd: 7, contentHash: 'fts-section-hash',
+    }],
+    passages: { contentHash: 'fts-candidate-passages', rows: [{ text: 'Replacement that must roll back.', pageLabel: 'p. 3', embedding: null }] },
+  };
+  assert.throws(() => repo.publishDocumentProfile(invalidFtsCandidate), /join/);
+  assert.equal(repo.getDocumentProfile('w3').versionId, changedAuditVersion,
+    'a late FTS projection failure cannot expose the candidate version');
+  assert.equal(sqlite.prepare("SELECT COUNT(*) n FROM document_profile_versions WHERE nodus_id='w3'").get().n, 2);
+  assert.equal(
+    sqlite.prepare("SELECT text FROM passages WHERE nodus_id='w3' ORDER BY chunk_index LIMIT 1").get().text,
+    'Pasaje estable anterior.',
+    'FTS failure rolls back staged passages with the profile transaction',
+  );
   sqlite.prepare("UPDATE works SET resolved_text_hash='replacement-source' WHERE nodus_id='w3'").run();
   assert.throws(() => repo.publishDocumentProfile(replayInput), /DOCUMENT_SOURCE_CHANGED/);
   sqlite.prepare("UPDATE works SET resolved_text_hash='stable-passages' WHERE nodus_id='w3'").run();
   sqlite.prepare("UPDATE works SET zotero_version=5 WHERE nodus_id='w3'").run();
   assert.throws(() => repo.publishDocumentProfile(replayInput), /DOCUMENT_SOURCE_CHANGED/);
-  assert.equal(repo.getDocumentProfile('w3').versionId, firstReplayVersion, 'a source change during analysis cannot overwrite the accepted profile');
+  assert.equal(repo.getDocumentProfile('w3').versionId, changedAuditVersion, 'a source change during analysis cannot overwrite the accepted profile');
 
   sqlite.prepare(`INSERT INTO works(
     nodus_id,zotero_key,title,authors_json,year,item_type,source_type,archived,
@@ -430,6 +586,43 @@ try {
     'paused',
     'exhausting source-change retries pauses the campaign for explicit user recovery',
   );
+  sqlite.prepare(`INSERT INTO works(
+    nodus_id,zotero_key,title,authors_json,year,item_type,source_type,archived,
+    light_status,deep_status,summary_status
+  ) VALUES('w5','Z5','Anclaje estable','[]',2025,'book','pdf',0,'done','done','none')`).run();
+  const anchoredInput = {
+    nodusId: 'w5', sourceFingerprint: 'w5-source', pipelineVersion: 'document-profile/6', schemaVersion: 2,
+    sourceLanguage: 'en', presentationLanguage: 'en', overview: 'Anchored profile.', profile: {},
+    resolvedText: 'Anchored quote.',
+    fields: [{ fieldId: 'w5-field', kind: 'thesis', ordinal: 0, text: 'Anchored claim.', confidence: 1, centrality: 1 }],
+    sections: [],
+    supports: [{
+      supportId: 'w5-support', targetKind: 'field', targetId: 'w5-field', sectionId: null,
+      passageId: 'w5#0', pageStart: 'p. 1', pageEnd: 'p. 1', sourceRef: 'source:w5',
+      pageStartNumber: 1, pageEndNumber: 1, charStart: 0, charEnd: 15,
+      quote: 'Anchored quote.', supportKind: 'direct', confidence: 1, validationStatus: 'valid',
+    }],
+    passages: {
+      contentHash: 'w5-source',
+      rows: [{ text: 'Anchored quote.', pageLabel: 'p. 1', sourceRef: 'source:w5', pageNumber: 1, embedding: null }],
+    },
+    ideaLinks: [], vectors: [], generatorModel: null, auditorModel: null, promptHash: 'w5-prompt',
+    audit: { passed: true, score: 1, supportCoverage: 1, structureCoverage: 1, issues: [], repaired: false },
+    qualityScore: 1,
+  };
+  const anchoredVersion = repo.publishDocumentProfile(anchoredInput);
+  passagesRepo.replaceWorkPassages('w5', 'w5-source', [{
+    text: 'Anchored quote.', pageLabel: 'p. 1', sourceRef: 'source:w5', pageNumber: 1, embedding: null,
+  }]);
+  assert.equal(sqlite.prepare(
+    'SELECT passage_id FROM document_profile_support WHERE version_id=?'
+  ).get(anchoredVersion).passage_id, null);
+  const reboundVersion = repo.publishDocumentProfile(anchoredInput);
+  assert.notEqual(reboundVersion, anchoredVersion,
+    'an idempotent replay republishes when passage replacement detached exact-support links');
+  assert.equal(sqlite.prepare(
+    'SELECT passage_id FROM document_profile_support WHERE version_id=?'
+  ).get(reboundVersion).passage_id, 'w5#0');
 
   sqlite.close();
   console.log('Document profile persistence test passed!');

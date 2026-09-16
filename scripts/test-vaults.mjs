@@ -24,6 +24,7 @@ if (!process.argv.includes('--electron-vaults-test')) {
         `export * as secrets from ${JSON.stringify(path.join(repoRoot, 'electron/secrets/secretStore.ts'))};`,
         `export * as settingsRepo from ${JSON.stringify(path.join(repoRoot, 'electron/db/settingsRepo.ts'))};`,
         `export * as provenance from ${JSON.stringify(path.join(repoRoot, 'electron/db/libraryAnalysisProvenance.ts'))};`,
+        `export * as documentProfiles from ${JSON.stringify(path.join(repoRoot, 'electron/db/documentProfilesRepo.ts'))};`,
         `export * as vaultCreationSettings from ${JSON.stringify(path.join(repoRoot, 'electron/vaults/vaultCreationSettings.ts'))};`,
       ].join('\n'),
       'utf8'
@@ -63,7 +64,7 @@ const [, , , bundle, userData] = process.argv;
 process.env.NODE_PATH = [path.join(repoRoot, 'node_modules'), process.env.NODE_PATH].filter(Boolean).join(path.delimiter);
 Module._initPaths();
 const require = createRequire(import.meta.url);
-const { registry, analysisReuse, database, secrets, settingsRepo, provenance, vaultCreationSettings } = require(bundle);
+const { registry, analysisReuse, database, documentProfiles, secrets, settingsRepo, provenance, vaultCreationSettings } = require(bundle);
 
 assert.equal(registry.getActiveVault().id, 'default');
 assert.equal(registry.getActiveVault().type, 'academic', 'pre-existing/legacy vault defaults to academic type');
@@ -225,6 +226,9 @@ db.prepare(`INSERT INTO works (
   nodus_id, zotero_key, title, light_hash, deep_hash, summary_hash, notes, manual_deep, read_tag
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
   .run('work-reused', 'ZOT-DEFAULT', 'Default work reused', 'light-hash', 'deep-hash', 'summary-hash', 'Private target note', 1, 1);
+db.prepare(`INSERT INTO document_profile_overrides(
+  override_id,nodus_id,field_path,base_version_id,generated_value_json,value_json,verified,conflict,created_at,updated_at
+) VALUES('target-override','work-reused','fields.thesis.0',NULL,'\"Target generated\"','\"Target correction\"',1,0,datetime('now'),datetime('now'))`).run();
 database.closeDb();
 
 await database.withVaultDatabase('default', () => seedProvenance(database.getDb(), settingsRepo.getSettings(), provenance));
@@ -273,7 +277,19 @@ assert.equal(countRows(db, 'work_summaries'), 1, 'reused summaries are available
 assert.equal(countRows(db, 'passages'), 1, 'reused passage embeddings are available in the target vault');
 assert.equal(countRows(db, 'document_profile_versions'), 1, 'the current document profile version is copied');
 assert.equal(countRows(db, 'document_vectors'), 1, 'whole-document vectors are copied without recomputation');
-assert.equal(countRows(db, 'document_profile_overrides'), 1, 'verified user corrections travel with the reusable profile');
+assert.equal(countRows(db, 'document_profile_overrides'), 1, 'target correction is preserved without a duplicate source override');
+assert.deepEqual(
+  db.prepare('SELECT value_json,conflict,base_version_id FROM document_profile_overrides WHERE nodus_id=? AND field_path=?')
+    .get('work-reused','fields.thesis.0'),
+  {
+    value_json: '\"Target correction\"',
+    conflict: 1,
+    base_version_id: db.prepare('SELECT current_version_id FROM document_profile_state WHERE nodus_id=?').get('work-reused').current_version_id,
+  },
+  'a target-vault correction wins and is flagged for review against the imported version',
+);
+assert.equal(documentProfiles.lexicalDocumentSearch('Target correction', 5)[0]?.nodusId, 'work-reused',
+  'the imported profile FTS projection uses the preserved target correction');
 assert.deepEqual(
   db.prepare('SELECT nodus_id, status FROM document_profile_state WHERE nodus_id=?').get('work-reused'),
   { nodus_id: 'work-reused', status: 'current' },

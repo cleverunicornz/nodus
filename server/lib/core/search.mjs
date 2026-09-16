@@ -80,6 +80,13 @@ export const SEARCH_FIELDS = [
   ['db_views', 'id', ['name', 'title', 'description']],
 ];
 
+const CURRENT_PROFILE_TABLES = {
+  document_profile_versions: true,
+  document_profile_fields: true,
+  document_sections: true,
+};
+
+
 const EXCERPT_CHARS = 600;
 
 // Snapshots published before the testimony projection may still contain a legacy
@@ -111,9 +118,15 @@ export function lexicalSearch(snapshot, query, limit = 20) {
   const needle = String(query ?? '').trim().toLowerCase();
   if (!needle) return [];
   const results = [];
+  const currentProfileVersions = new Set(
+    rows(snapshot, 'document_profile_state')
+      .map((row) => row.current_version_id)
+      .filter((value) => typeof value === 'string' && value),
+  );
   for (const [table, key, fields] of SEARCH_FIELDS) {
     for (const sourceRow of rows(snapshot, table)) {
       const row = table.startsWith('testimony_') ? testimonySafeRow(sourceRow) : sourceRow;
+      if (CURRENT_PROFILE_TABLES[table] && !currentProfileVersions.has(row.version_id)) continue;
       const text = fields.map((field) => row[field]).filter((value) => typeof value === 'string').join('\n');
       if (text.toLowerCase().includes(needle)) {
         // A row nothing can name is dropped rather than served: an unnameable hit is one

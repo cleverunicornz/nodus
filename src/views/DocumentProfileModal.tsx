@@ -42,10 +42,13 @@ export function DocumentProfileModal({ work, vaultId, onClose }: { work: WorkVie
       window.nodus.getDocumentProfileStatuses([work.nodus_id]),
       window.nodus.getDocumentIndexProgress(),
     ]);
+    const workJobs = progress.jobs.filter((item) => item.vaultId === vaultId && item.nodusId === work.nodus_id);
+    const activeJob = workJobs.find((item) => ['queued', 'running', 'paused'].includes(item.status)) ?? null;
+    const latestFailure = workJobs.find((item) => item.status === 'failed' || item.status === 'unavailable') ?? null;
     setProfile(nextProfile);
     setStatus(states[0]?.status ?? 'missing');
-    setError(states[0]?.error ?? null);
-    setJob(progress.jobs.find((item) => item.vaultId === vaultId && item.nodusId === work.nodus_id && ['queued', 'running', 'paused'].includes(item.status)) ?? null);
+    setError(states[0]?.error ?? latestFailure?.error ?? null);
+    setJob(activeJob);
   }, [vaultId, work.nodus_id]);
 
   useEffect(() => {
@@ -139,6 +142,11 @@ export function DocumentProfileModal({ work, vaultId, onClose }: { work: WorkVie
               <p className="mt-2 text-xs leading-5 text-neutral-500">{error ?? t('Nodus leerá la obra completa por secciones, sintetizará su arquitectura y auditará cada campo antes de publicarlo.')}</p>
             </div>
           ) : <div className="space-y-6">
+            {error && !job && <div className="rounded-lg border border-red-800/60 bg-red-950/20 p-3 text-xs text-red-200">
+              <div className="flex items-center gap-2 font-medium"><Icon name="alert" size={14} />{t('La última actualización de esta ficha falló')}</div>
+              <p className="mt-1 leading-5 text-red-200/80">{t('Se muestra la última versión publicada. El error de actualización se conserva para que no parezca una ficha recién validada.')}</p>
+              <p className="mt-2 break-words font-mono text-[11px] text-red-300/80">{error}</p>
+            </div>}
             {(profile.audit?.fallback || degradedSections > 0) && <div className="rounded-lg border border-amber-700/60 bg-amber-950/20 p-3 text-xs text-amber-200">
               <div className="flex items-center gap-2 font-medium"><Icon name="alert" size={14} />{profile.audit?.fallback === 'extractive'
                 ? t('Indexado sin síntesis')
@@ -157,7 +165,7 @@ export function DocumentProfileModal({ work, vaultId, onClose }: { work: WorkVie
               </details>}
             </div>}
             <section>
-              <div className="mb-2 flex items-center justify-between gap-3"><h3 className="text-xs font-semibold uppercase tracking-wide text-neutral-500">{t('Visión de conjunto')}</h3><div className="flex items-center gap-2"><span className="text-xs text-neutral-500">{profile.qualityScore == null ? t('Sin puntuación semántica') : tx('Calidad {score}%', { score: Math.round(profile.qualityScore * 100) })}</span><button className="text-xs text-cyan-400 hover:text-cyan-200" onClick={() => setEditing({ path: 'overview', value: profile.overview, generatedValue: profile.generatedOverview ?? profile.overview, overrideId: profile.overviewOverrideId })}>{t('Corregir')}</button></div></div>
+              <div className="mb-2 flex items-center justify-between gap-3"><h3 className="text-xs font-semibold uppercase tracking-wide text-neutral-500">{t('Visión de conjunto')}</h3><div className="flex items-center gap-2"><span className="text-xs text-neutral-500">{profile.audit?.fallback === 'extractive' || profile.qualityScore == null ? t('Sin puntuación semántica') : tx('Calidad {score}%', { score: Math.round(profile.qualityScore * 100) })}</span><button className="text-xs text-cyan-400 hover:text-cyan-200" onClick={() => setEditing({ path: 'overview', value: profile.overview, generatedValue: profile.generatedOverview ?? profile.overview, overrideId: profile.overviewOverrideId })}>{t('Corregir')}</button></div></div>
               <p className={`rounded-lg border bg-neutral-900/40 p-4 text-sm leading-6 text-neutral-200 ${profile.overviewConflict ? 'border-amber-600' : profile.overviewOverridden ? 'border-cyan-800' : 'border-neutral-800'}`}>{profile.overview}{profile.overviewOverridden && <span className="ml-2 text-[10px] uppercase text-cyan-500">{profile.overviewConflict ? t('Revisar corrección') : t('Corregido por ti')}</span>}</p>
             </section>
             <section>

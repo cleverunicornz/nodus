@@ -33,3 +33,19 @@ test('specialized search preserves archive domain keys and testimony text fields
   const testimony = lexicalSearch({ tables: { testimony_transcripts: [{ id: 'tr-1', content_markdown: 'La plaza estaba llena' }] } }, 'plaza', 50);
   assert.equal(testimony[0]?.id, 'tr-1');
 });
+
+test('ordinary server search excludes superseded document profile history', () => {
+  const snapshot = { tables: {
+    document_profile_state: [{ nodus_id: 'w1', current_version_id: 'v2' }],
+    document_profile_versions: [
+      { version_id: 'v1', nodus_id: 'w1', overview: 'OLD_PROFILE_ONLY' },
+      { version_id: 'v2', nodus_id: 'w1', overview: 'CURRENT_PROFILE_ONLY' },
+    ],
+    document_profile_fields: [
+      { field_id: 'f1', version_id: 'v1', nodus_id: 'w1', text: 'OLD_FIELD_ONLY' },
+      { field_id: 'f2', version_id: 'v2', nodus_id: 'w1', text: 'CURRENT_FIELD_ONLY' },
+    ],
+  } };
+  assert.deepEqual(lexicalSearch(snapshot, 'OLD_', 50), []);
+  assert.ok(lexicalSearch(snapshot, 'CURRENT_', 50).length >= 1);
+});

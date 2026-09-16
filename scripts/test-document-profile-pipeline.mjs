@@ -17,7 +17,7 @@ globalThis.__documentPipeline = {
   forceSectionAuditFailure: false, forceDocumentAuditFailure: false, forceEmptyProfile: false,
   forceSectionSchemaFailure: false, onEmbed: null, sourceReads: 0, changedTextAtPublication: null,
   sectionTitles: [], overrides: {}, auditPayloadChars: [], auditTruncations: 0,
-  localContextWindow: null, promptChars: [],
+  localContextWindow: null, promptChars: [], ideaRows: [], currentPassageHash: null, deltaRepairCalls: 0,
 };
 
 await build({
@@ -31,27 +31,31 @@ await build({
         buildApi.onLoad({ filter: new RegExp(`^${name}$`), namespace: 'stub' }, () => ({ contents, loader: 'js' }));
       };
       stub(/\.\.\/db\/database$/, 'database', `export function getDb(){return {prepare(sql){return {
-        get(){if(sql.includes('COUNT(*) count'))return {count:0,hash:null};if(sql.includes('document_index_jobs'))return {nodus_id:'w1'};return null},
-        all(){if(sql.includes('FROM passages'))return globalThis.__documentPipeline.passages;if(sql.includes('FROM ideas'))return [];return []}
+        get(){if(sql.includes('COUNT(*) count'))return globalThis.__documentPipeline.currentPassageHash
+          ? {count:globalThis.__documentPipeline.passages.length,hash:globalThis.__documentPipeline.currentPassageHash}
+          : {count:0,hash:null};if(sql.includes('document_index_jobs'))return {nodus_id:'w1'};return null},
+        all(){if(sql.includes('FROM passages'))return globalThis.__documentPipeline.passages;if(sql.includes('FROM ideas'))return globalThis.__documentPipeline.ideaRows;return []}
       }}}}`);
       stub(/\.\.\/db\/settingsRepo$/, 'settings', `export function getSettings(){return {
         zoteroUserId:'0',zoteroStoragePath:'',unpaywallEmail:'',preferZoteroFulltext:true,
         ocrEnabled:false,ocrLanguages:'spa+eng',ocrMaxPages:300,promptLanguage:'es'
       }}`);
       stub(/\.\.\/db\/documentProfilesRepo$/, 'profile-repo', `
+        export class DocumentProfilePublicationError extends Error{constructor(message){super(message);this.code='publish_failed'}}
         export function clearDocumentCheckpoints(id){for(const key of globalThis.__documentPipeline.checkpoints.keys())if(key.startsWith(id+':'))globalThis.__documentPipeline.checkpoints.delete(key)}
         export function readDocumentCheckpoint(id,key,hash){return globalThis.__documentPipeline.checkpoints.get(id+':'+key+':'+hash)??null}
         export function saveDocumentCheckpoint(id,key,hash,payload){globalThis.__documentPipeline.checkpoints.set(id+':'+key+':'+hash,payload)}
         export function setDocumentProfileState(id,status,patch){globalThis.__documentPipeline.states.push({id,status,patch})}
         export function updateDocumentIndexJob(id,patch){globalThis.__documentPipeline.jobs.push({id,patch})}
         export function advanceRunningDocumentIndexJob(id,phase,progress,state){globalThis.__documentPipeline.jobs.push({id,patch:{phase,progress,state}});return true}
-        export function publishDocumentProfile(input){globalThis.__documentPipeline.published=input;if(input.passages)globalThis.__documentPipeline.passages=input.passages.rows.map((row,index)=>({passage_id:input.nodusId+'#'+index,text:row.text}));return 'published-v1'}
+        export function publishDocumentProfile(input){globalThis.__documentPipeline.published=input;if(input.passages){globalThis.__documentPipeline.currentPassageHash=input.passages.contentHash;globalThis.__documentPipeline.passages=input.passages.rows.map((row,index)=>({passage_id:input.nodusId+'#'+index,chunk_index:index,...row,page_label:row.pageLabel,source_ref:row.sourceRef??null,page_number:row.pageNumber??null}))}return 'published-v1'}
       `);
       stub(/\.\.\/db\/worksRepo$/, 'works-repo', `
         export function setResolvedTextState(id,state){globalThis.__documentPipeline.resolvedState={id,state}}
       `);
       stub(/\.\.\/db\/ideasRepo$/, 'ideas', `
-        export function cosineSimilarity(){return 0} export function decodeEmbedding(){return []}
+        export function cosineSimilarity(_idea,vector){return vector?.[1] === 1 ? .99 : .8}
+        export function decodeEmbedding(){return [1,0,0]}
         export function currentEmbeddingConfig(){return {provider:'openrouter',model:'baai/bge-m3'}}
       `);
       stub(/\.\.\/db\/libraryAnalysisProvenance$/, 'provenance', `
@@ -69,7 +73,7 @@ await build({
           sourceType:doc.sourceType,textHash:'fixture-hash',textChars:doc.text.length,
           sourceCount:1,hasPageMarkers:false,blockReason:null,resolvedAt:'2026-08-24T00:00:00.000Z',notes:doc.notes,sources:[]
         }}
-        export function planRetrievalChunks(text){return [{text:text.replace(/\\[\\[p\\. \\d+\\]\\]/g,' '),pageLabel:'p. 1'}]}
+        export function planRetrievalChunks(text){return [{text:text.replace(/\\[\\[p\\. \\d+\\]\\]/g,' '),pageLabel:'p. 1',pageEndLabel:'p. 2',sourceRef:null,pageNumber:1,pageEndNumber:2,charStart:0,charEnd:text.length}]}
       `);
       stub(/\.\.\/zotero\/zoteroClient$/, 'zotero', `export const LOCAL_USER_ID='0';export async function getItem(){return {abstract:'Resumen original'}}`);
       stub(/\.\/aiClient$/, 'ai', `
@@ -96,11 +100,12 @@ await build({
           const documentAudit=opts.system.includes('Audita una ficha')||(input.profile!==undefined&&input.deterministic!==undefined);
           const sectionReduce=opts.system.includes('Fusiona análisis parciales')||(Array.isArray(input.analyses)&&typeof input.title==='string');
           const profileRepair=opts.system.includes('Repara la ficha')||(input.profile!==undefined&&input.audit!==undefined);
+          const deltaRepair=input.base_revision!==undefined;
           {
             const kind = sectionAnalysis && !(input.analysis!==undefined&&input.fragment!==undefined) ? 'section'
               : sectionAudit ? 'sectionAudit' : sectionReduce ? 'reduce'
               : profileSynthesis ? 'synthesis' : documentAudit ? 'documentAudit'
-              : profileRepair ? 'repair' : 'unknown';
+              : deltaRepair ? 'deltaRepair' : profileRepair ? 'repair' : 'unknown';
             globalThis.__documentPipeline.promptChars.push({kind, tokens: estimateLocalTokens(opts.system + opts.user), chars: opts.user.length});
           }
           // A local server refuses a prompt its loaded window cannot hold, which is the
@@ -111,11 +116,30 @@ await build({
           if(globalThis.__documentPipeline.forceSectionSchemaFailure && sectionAnalysis){
             throw new AiError('El JSON no cumple el esquema esperado');
           }
-          if(sectionAudit){globalThis.__documentPipeline.sectionAuditCalls++;return globalThis.__documentPipeline.forceSectionAuditFailure
-            ? {passed:false,issues:['El proveedor insiste en rechazar la sección.'],analysis:input.analysis}
-            : {passed:true,issues:[],analysis:input.analysis};
+          if(sectionAudit){
+            globalThis.__documentPipeline.sectionAuditCalls++;
+            const overrides=globalThis.__documentPipeline.overrides??{};
+            if(typeof overrides.sectionAuditResponder==='function'){
+              const response=overrides.sectionAuditResponder(input,globalThis.__documentPipeline.sectionAuditCalls);
+              if(response)return response;
+            }
+            return globalThis.__documentPipeline.forceSectionAuditFailure
+              ? {passed:false,issues:['El proveedor insiste en rechazar la sección.'],analysis:input.analysis}
+              : {passed:true,issues:[],analysis:null};
           };
           if(sectionReduce)return input.analyses[0];
+          if(deltaRepair){
+            const overrides=globalThis.__documentPipeline.overrides??{};
+            globalThis.__documentPipeline.deltaRepairCalls++;
+            if((overrides.repairTruncations??0)>0){
+              overrides.repairTruncations--;
+              throw new AiError('El delta se truncó.',true,false,'output_truncated');
+            }
+            const queued=Array.isArray(overrides.repairDeltas)?overrides.repairDeltas.shift():null;
+            return typeof queued==='function'
+              ? queued(input)
+              : queued??{base_revision:input.base_revision,operations:[],overview:null};
+          }
           if(profileRepair)return {
             source_language:'es',overview:'La obra estudia una modernización desigual.',
             fields:[{kind:'thesis',text:'La modernización avanzó con ritmos regionales distintos.',confidence:0,centrality:1,
@@ -142,12 +166,19 @@ await build({
               throw new AiError('El proveedor agotó el presupuesto de salida del JSON.',true,false,'output_truncated');
             }
             const overrides=globalThis.__documentPipeline.overrides??{};
+            if(typeof overrides.auditResponder==='function')return overrides.auditResponder(input,globalThis.__documentPipeline.auditCalls);
+            const operations=typeof overrides.auditOperations==='function'
+              ? overrides.auditOperations(input)
+              : overrides.auditOperations ?? [];
             return globalThis.__documentPipeline.forceDocumentAuditFailure ? {
-            passed:false,score:.8,issues:['El auditor discrepa de la paráfrasis.'],field_fixes:[],overview:''
-          } : {
-            passed:overrides.auditPassed ?? true,score:overrides.auditScore ?? .95,issues:overrides.auditIssues ?? [],
-            field_fixes:overrides.auditFixes ?? [{index:0,text:'La formulación auditada conserva su apoyo.',support_quote:'Una paráfrasis inexistente no puede sustituir la cita.'}],overview:''
-          }};
+              candidate_revision:input.candidate_revision,passed:false,score:.8,
+              issues:[{code:'rejected',blocking:true,target:{kind:'profile'},explanation:'El auditor discrepa de la paráfrasis.'}],
+              operations:[],overview:null
+            } : {
+              candidate_revision:input.candidate_revision,
+              passed:overrides.auditPassed ?? true,score:overrides.auditScore ?? .95,issues:overrides.auditIssues ?? [],
+              operations,overview:overrides.auditOverview ?? null
+            }};
           throw new Error('unexpected prompt '+opts.system.slice(0,20));
         }
       `);
@@ -201,11 +232,28 @@ test('a short preamble is absorbed by the first section instead of leaving a cov
   const covered = sections.reduce((total, section) => total + Math.max(0, (section.charEnd ?? 0) - (section.charStart ?? 0)), 0);
   assert.equal(sections.length, 1, 'a short preamble does not become a section of its own');
   assert.equal(sections[0].charStart, 0, 'the first section reaches the beginning of the document');
+
   assert.ok(
     sections[0].body.startsWith('Título breve'),
     'the preamble is analysed with the first section rather than dropped',
   );
   assert.ok(covered / text.length >= 0.95, `the document is fully accounted for (${covered}/${text.length} chars)`);
+});
+test('checkpoint fingerprints include pipeline prompt language and models', () => {
+  const base = {
+    pipelineVersion: 'document-profile/7',
+    kind: 'section:test',
+    language: 'en',
+    generatorModel: { provider: 'openrouter', model: 'generator-a' },
+    auditorModel: { provider: 'openrouter', model: 'auditor-a' },
+    payload: { text: 'same source' },
+  };
+  const fingerprint = pipeline.documentProfileCheckpointFingerprint(base);
+  assert.notEqual(fingerprint, pipeline.documentProfileCheckpointFingerprint({ ...base, pipelineVersion: 'document-profile/6' }));
+  assert.notEqual(fingerprint, pipeline.documentProfileCheckpointFingerprint({ ...base, language: 'es' }));
+  assert.notEqual(fingerprint, pipeline.documentProfileCheckpointFingerprint({
+    ...base, auditorModel: { provider: 'openrouter', model: 'auditor-b' },
+  }));
 });
 
 test('structure resolves combined source/page markers to durable attachment locators', () => {
@@ -221,15 +269,26 @@ test('structure resolves combined source/page markers to durable attachment loca
 
 test('provider audit variants normalize conservatively instead of aborting the job', () => {
   const normalized = pipeline.normalizeDocumentProfileAuditResponse({
+    candidate_revision: 'revision-1',
     passed: 'true',
     score: '0.91',
     issues: 'Ajustar una formulación menor.',
     field_fixes: [{ index: '2', text: 'Texto corregido', support_quote: 'Apoyo literal' }],
-  });
+  }, 'revision-1', ['field-0', 'field-1', 'field-2']);
   assert.equal(normalized.passed, true);
   assert.equal(normalized.score, 0.91);
-  assert.deepEqual(normalized.issues, ['Ajustar una formulación menor.']);
-  assert.deepEqual(normalized.field_fixes, [{ index: 2, text: 'Texto corregido', support_quote: 'Apoyo literal' }]);
+  assert.equal(normalized.issues[0].explanation, 'Ajustar una formulación menor.');
+  assert.deepEqual(normalized.operations, [{
+    op: 'edit_field', target: 'field-2', kind: null, text: 'Texto corregido',
+    supportQuote: 'Apoyo literal', evidenceHandle: null, confidence: null, centrality: null,
+  }]);
+  assert.equal(
+    pipeline.normalizeDocumentProfileAuditResponse({
+      candidate_revision: 'stale', passed: true, score: 1,
+    }, 'current').passed,
+    false,
+    'a verdict for a stale candidate revision can never publish a mutation',
+  );
   assert.equal(
     pipeline.normalizeDocumentProfileAuditResponse({ score: 0.99 }).passed,
     false,
@@ -245,6 +304,62 @@ test('provider audit variants normalize conservatively instead of aborting the j
     false,
     'a wrapped response without an explicit verdict remains rejected',
   );
+});
+test('typed repair deltas are revision-bound, atomic, and evidence-scoped', () => {
+  const profile = {
+    source_language: 'en',
+    overview: 'Original overview',
+    fields: [
+      { handle: 'field-a', kind: 'argument', text: 'Remove me', confidence: .8, centrality: .4, support_quote: 'Literal support A.', page: 'p. 1' },
+      { handle: 'field-b', kind: 'argument', text: 'Keep me', confidence: .9, centrality: .8, support_quote: 'Literal support B.', page: 'p. 1' },
+    ],
+  };
+  const section = {
+    sectionId: 'section-a', parentSectionId: null, level: 1, ordinal: 0, title: 'Section',
+    role: null, summary: 'Summary', concepts: [], claims: [], pageStart: 'p. 1', pageEnd: 'p. 1',
+    sourceRef: null, pageStartNumber: 1, pageEndNumber: 1, charStart: 0, charEnd: 45,
+    contentHash: 'section-hash', body: 'Literal support A. Literal support B. Added support.',
+  };
+  const evidence = [
+    { handle: 'section-a:claim:0', sectionId: 'section-a', quote: 'Literal support B.', page: 'p. 1' },
+    { handle: 'section-a:claim:1', sectionId: 'section-a', quote: 'Added support.', page: 'p. 1' },
+  ];
+  const applied = pipeline.applyDocumentProfileRepairDeltaForTest({
+    profile,
+    expectedRevision: 'revision-1',
+    evidence,
+    sections: [section],
+    delta: {
+      baseRevision: 'revision-1',
+      overview: 'Repaired overview',
+      operations: [
+        { op: 'remove_field', target: 'field-a', kind: null, text: null, supportQuote: null, evidenceHandle: null, confidence: null, centrality: null },
+        { op: 'edit_field', target: 'field-b', kind: 'conclusion', text: 'Reclassified', supportQuote: null, evidenceHandle: null, confidence: null, centrality: null },
+        { op: 'add_field', target: null, kind: 'finding', text: 'Added result', supportQuote: 'Added support.', evidenceHandle: 'section-a:claim:1', confidence: .95, centrality: .7 },
+      ],
+    },
+  });
+  assert.deepEqual(applied.errors, []);
+  assert.equal(applied.changed, true);
+  assert.equal(applied.profile.overview, 'Repaired overview');
+  assert.deepEqual(applied.profile.fields.map((field) => [field.kind, field.text]), [
+    ['conclusion', 'Reclassified'],
+    ['finding', 'Added result'],
+  ]);
+  const stale = pipeline.applyDocumentProfileRepairDeltaForTest({
+    profile, expectedRevision: 'revision-1', evidence, sections: [section],
+    delta: { baseRevision: 'stale', overview: null, operations: [] },
+  });
+  assert.deepEqual(stale.errors, ['stale_revision']);
+  const invalid = pipeline.applyDocumentProfileRepairDeltaForTest({
+    profile, expectedRevision: 'revision-1', evidence, sections: [section],
+    delta: {
+      baseRevision: 'revision-1', overview: null,
+      operations: [{ op: 'add_field', target: null, kind: 'finding', text: 'Unsupported', supportQuote: 'Not supplied', evidenceHandle: 'section-a:claim:1', confidence: 1, centrality: 1 }],
+    },
+  });
+  assert.deepEqual(invalid.errors, ['invalid_evidence']);
+  assert.deepEqual(invalid.profile, profile, 'one invalid operation rejects the whole delta');
 });
 
 test('full pipeline reads sections, audits once, embeds facets and publishes atomically', async () => {
@@ -276,6 +391,12 @@ test('full pipeline reads sections, audits once, embeds facets and publishes ato
   assert.ok(published.supports.every((support) => support.confidence >= 0.8), 'published literal supports carry the deterministic floor');
   assert.ok(published.sections.length >= 2);
   assert.ok(published.supports.some((support) => support.targetKind === 'field' && support.validationStatus === 'valid'));
+  assert.equal(published.supports[0].passageId, 'w1#0', 'a literal support binds to the containing planned passage');
+  assert.equal(
+    published.resolvedText.slice(published.supports[0].charStart, published.supports[0].charEnd).replace(/\s+/g, ' '),
+    published.supports[0].quote,
+    'published support ranges identify the exact source occurrence',
+  );
   assert.ok(published.vectors.some((vector) => vector.kind === 'overview'));
   assert.ok(published.vectors.some((vector) => vector.kind === 'section'));
   assert.ok(published.vectors.every((vector) => vector.embeddingProvider === 'openrouter' && vector.embeddingModel === 'baai/bge-m3'));
@@ -283,6 +404,220 @@ test('full pipeline reads sections, audits once, embeds facets and publishes ato
   assert.equal(published.passages.embeddingModel, 'baai/bge-m3');
   assert.ok(globalThis.__documentPipeline.passages.length > 0, 'full text is also made lexically/citably retrievable');
 });
+test('an overview mutation is re-audited as a new candidate revision', async () => {
+  globalThis.__documentPipeline.sourceReads = 0;
+  globalThis.__documentPipeline.auditCalls = 0;
+  globalThis.__documentPipeline.text = `# Introducción\n[[p. 1]]\nLa obra plantea su problema.\n## Desarrollo\n[[p. 2]]\nEl proceso avanzó de manera desigual entre las regiones.\n${'Desarrollo histórico completo. '.repeat(100)}`;
+  const work = {
+    nodus_id:'w1',zotero_key:'Z1',zotero_version:1,title:'Modernización',authors_json:'["Autora"]',year:2024,
+    item_type:'book',doi:null,read_tag:0,manual_deep:0,deep_trigger:null,source_type:'markdown',light_status:'done',
+    light_at:null,light_hash:null,deep_status:'done',deep_at:null,deep_hash:null,summary_status:'none',summary_at:null,
+    summary_hash:null,archived:0,notes:null,
+  };
+  globalThis.__documentPipeline.overrides = { auditOverview: 'Overview corrected by the auditor.' };
+  try {
+    await pipeline.runDocumentProfileScan(work, {
+      jobId:'job-overview-revision',generatorModel:null,auditorModel:null,onProgress() {},
+    });
+  } finally {
+    globalThis.__documentPipeline.overrides = {};
+  }
+  assert.equal(globalThis.__documentPipeline.auditCalls, 2,
+    'the verdict that proposed a mutation cannot approve the mutated candidate');
+  assert.equal(globalThis.__documentPipeline.published.overview, 'Overview corrected by the auditor.');
+  assert.equal(globalThis.__documentPipeline.published.audit.fallback, null);
+});
+
+test('a rejected field is repaired by a bounded delta and the result is re-audited', async () => {
+  globalThis.__documentPipeline.sourceReads = 0;
+  globalThis.__documentPipeline.auditCalls = 0;
+  globalThis.__documentPipeline.text = `# Introducción\n[[p. 1]]\nLa obra plantea su problema.\n## Desarrollo\n[[p. 2]]\nEl proceso avanzó de manera desigual entre las regiones.\n${'Desarrollo histórico completo. '.repeat(100)}`;
+  const work = {
+    nodus_id:'w1',zotero_key:'Z1',zotero_version:1,title:'Modernización',authors_json:'["Autora"]',year:2024,
+    item_type:'book',doi:null,read_tag:0,manual_deep:0,deep_trigger:null,source_type:'markdown',light_status:'done',
+    light_at:null,light_hash:null,deep_status:'done',deep_at:null,deep_hash:null,summary_status:'none',summary_at:null,
+    summary_hash:null,archived:0,notes:null,
+  };
+  globalThis.__documentPipeline.overrides = {
+    auditResponder(input, call) {
+      return call === 1 ? {
+        candidate_revision: input.candidate_revision,
+        passed: false,
+        score: .8,
+        issues: [{ code: 'field_wording', blocking: true, target: { kind: 'field', handle: input.profile.fields[0].handle }, explanation: 'Repair one field.' }],
+        operations: [],
+        overview: null,
+      } : {
+        candidate_revision: input.candidate_revision, passed: true, score: .96,
+        issues: [], operations: [], overview: null,
+      };
+    },
+    repairDeltas: [(input) => ({
+      base_revision: input.base_revision,
+      operations: [{
+        op: 'edit_field',
+        target: input.fields[0].handle,
+        text: 'Corrected bounded field.',
+      }],
+      overview: null,
+    })],
+  };
+  try {
+    await pipeline.runDocumentProfileScan(work, {
+      jobId:'job-delta-repair',generatorModel:null,auditorModel:null,onProgress() {},
+    });
+  } finally {
+    globalThis.__documentPipeline.overrides = {};
+  }
+  assert.equal(globalThis.__documentPipeline.auditCalls, 2);
+  assert.equal(globalThis.__documentPipeline.published.fields[0].text, 'Corrected bounded field.');
+  assert.equal(globalThis.__documentPipeline.published.audit.passed, true);
+  assert.equal(globalThis.__documentPipeline.published.audit.fallback, null);
+});
+test('a truncated singleton repair applies nothing and retries one bounded delta', async () => {
+  globalThis.__documentPipeline.sourceReads = 0;
+  globalThis.__documentPipeline.auditCalls = 0;
+  globalThis.__documentPipeline.deltaRepairCalls = 0;
+  globalThis.__documentPipeline.text = `# Introducción\n[[p. 1]]\nLa obra plantea su problema.\n## Desarrollo\n[[p. 2]]\nEl proceso avanzó de manera desigual entre las regiones.\n${'Desarrollo histórico completo. '.repeat(100)}`;
+  const work = {
+    nodus_id:'w1',zotero_key:'Z1',zotero_version:1,title:'Modernización',authors_json:'["Autora"]',year:2024,
+    item_type:'book',doi:null,read_tag:0,manual_deep:0,deep_trigger:null,source_type:'markdown',light_status:'done',
+    light_at:null,light_hash:null,deep_status:'done',deep_at:null,deep_hash:null,summary_status:'none',summary_at:null,
+    summary_hash:null,archived:0,notes:null,
+  };
+  globalThis.__documentPipeline.overrides = {
+    repairTruncations: 1,
+    auditResponder(input, call) {
+      return call === 1 ? {
+        candidate_revision: input.candidate_revision, passed: false, score: .7,
+        issues: [{ code: 'field_wording', blocking: true, target: { kind: 'field', handle: input.profile.fields[0].handle }, explanation: 'Repair one field.' }],
+        operations: [], overview: null,
+      } : {
+        candidate_revision: input.candidate_revision, passed: true, score: .95,
+        issues: [], operations: [], overview: null,
+      };
+    },
+    repairDeltas: [(input) => ({
+      base_revision: input.base_revision,
+      operations: [{ op: 'edit_field', target: input.fields[0].handle, text: 'Recovered after truncation.' }],
+      overview: null,
+    })],
+  };
+  try {
+    await pipeline.runDocumentProfileScan(work, {
+      jobId:'job-delta-truncation',generatorModel:null,auditorModel:null,onProgress() {},
+    });
+  } finally {
+    globalThis.__documentPipeline.overrides = {};
+  }
+  assert.equal(globalThis.__documentPipeline.deltaRepairCalls, 2);
+  assert.equal(globalThis.__documentPipeline.published.fields[0].text, 'Recovered after truncation.');
+  assert.equal(globalThis.__documentPipeline.published.audit.passed, true);
+});
+test('a section-only issue repairs that section and re-audits the synchronized candidate', async () => {
+  globalThis.__documentPipeline.sourceReads = 0;
+  globalThis.__documentPipeline.auditCalls = 0;
+  globalThis.__documentPipeline.text = `# Introducción\n[[p. 1]]\nLa obra plantea su problema.\n## Desarrollo\n[[p. 2]]\nEl proceso avanzó de manera desigual entre las regiones.\n${'Desarrollo histórico completo. '.repeat(100)}`;
+  const work = {
+    nodus_id:'w1',zotero_key:'Z1',zotero_version:1,title:'Modernización',authors_json:'["Autora"]',year:2024,
+    item_type:'book',doi:null,read_tag:0,manual_deep:0,deep_trigger:null,source_type:'markdown',light_status:'done',
+    light_at:null,light_hash:null,deep_status:'done',deep_at:null,deep_hash:null,summary_status:'none',summary_at:null,
+    summary_hash:null,archived:0,notes:null,
+  };
+  let targetedCalls = 0;
+  globalThis.__documentPipeline.overrides = {
+    auditResponder(input, call) {
+      return call === 1 ? {
+        candidate_revision: input.candidate_revision,
+        passed: false,
+        score: .8,
+        issues: [{
+          code: 'section_summary',
+          blocking: true,
+          target: { kind: 'section', handle: input.sections[0].id },
+          explanation: 'Repair this section summary.',
+        }],
+        operations: [],
+        overview: null,
+      } : {
+        candidate_revision: input.candidate_revision, passed: true, score: .96,
+        issues: [], operations: [], overview: null,
+      };
+    },
+    sectionAuditResponder(input) {
+      if (!input.prior_issues?.length) return null;
+      targetedCalls += 1;
+      return targetedCalls === 1 ? {
+        passed: false,
+        issues: [],
+        analysis: { ...input.analysis, summary: 'Corrected section summary.', role: 'method' },
+      } : { passed: true, issues: [], analysis: null };
+    },
+  };
+  try {
+    await pipeline.runDocumentProfileScan(work, {
+      jobId:'job-section-repair',generatorModel:null,auditorModel:null,onProgress() {},
+    });
+  } finally {
+    globalThis.__documentPipeline.overrides = {};
+  }
+  assert.equal(globalThis.__documentPipeline.auditCalls, 2);
+  assert.equal(targetedCalls, 1);
+  assert.equal(globalThis.__documentPipeline.published.sections[0].summary, 'Corrected section summary.');
+  assert.equal(globalThis.__documentPipeline.published.audit.passed, true);
+  assert.equal(globalThis.__documentPipeline.published.audit.fallback, null);
+});
+test('cached passages are replanned for exact anchors without replacing compatible rows', async () => {
+  globalThis.__documentPipeline.sourceReads = 0;
+  globalThis.__documentPipeline.published = null;
+  globalThis.__documentPipeline.text = `# Introducción\n[[p. 1]]\nLa obra plantea su problema.\n## Desarrollo\n[[p. 2]]\nEl proceso avanzó de manera\n   desigual entre las regiones.\n${'Desarrollo histórico completo. '.repeat(100)}`;
+  const work = {
+    nodus_id:'w1',zotero_key:'Z1',zotero_version:1,title:'Modernización',authors_json:'["Autora"]',year:2024,
+    item_type:'book',doi:null,read_tag:0,manual_deep:0,deep_trigger:null,source_type:'markdown',light_status:'done',
+    light_at:null,light_hash:null,deep_status:'done',deep_at:null,deep_hash:null,summary_status:'none',summary_at:null,
+    summary_hash:null,archived:0,notes:null,
+  };
+  globalThis.__documentPipeline.currentPassageHash = null;
+  globalThis.__documentPipeline.passages = [];
+  await pipeline.runDocumentProfileScan(work, {
+    jobId:'job-seed-cached-passages',generatorModel:null,auditorModel:null,onProgress() {},
+  });
+  const before = structuredClone(globalThis.__documentPipeline.passages);
+  globalThis.__documentPipeline.sourceReads = 0;
+  globalThis.__documentPipeline.published = null;
+  await pipeline.runDocumentProfileScan(work, {
+    jobId:'job-cached-passages',generatorModel:null,auditorModel:null,onProgress() {},
+  });
+  assert.equal(globalThis.__documentPipeline.published.passages, null,
+    'compatible persisted passage rows are not re-embedded or replaced');
+  assert.deepEqual(globalThis.__documentPipeline.passages, before);
+  assert.equal(globalThis.__documentPipeline.published.supports[0].passageId, 'w1#0',
+    'the ephemeral replan still binds supports on the cached path');
+});
+test('idea alignment never targets the non-materialized overview vector', async () => {
+  globalThis.__documentPipeline.sourceReads = 0;
+  globalThis.__documentPipeline.ideaRows = [{ global_id: 'idea-1', embedding: Buffer.alloc(12) }];
+  globalThis.__documentPipeline.text = `# Introducción\n[[p. 1]]\nLa obra plantea su problema.\n## Desarrollo\n[[p. 2]]\nEl proceso avanzó de manera desigual entre las regiones.\n${'Desarrollo histórico completo. '.repeat(100)}`;
+  const work = {
+    nodus_id:'w1',zotero_key:'Z1',zotero_version:1,title:'Modernización',authors_json:'[\"Autora\"]',year:2024,
+    item_type:'book',doi:null,read_tag:0,manual_deep:0,deep_trigger:null,source_type:'markdown',light_status:'done',
+    light_at:null,light_hash:null,deep_status:'done',deep_at:null,deep_hash:null,summary_status:'none',summary_at:null,
+    summary_hash:null,archived:0,notes:null,
+  };
+  try {
+    await pipeline.runDocumentProfileScan(work, {
+      jobId:'job-overview-alignment',generatorModel:null,auditorModel:null,onProgress() {},
+    });
+  } finally {
+    globalThis.__documentPipeline.ideaRows = [];
+  }
+  const published = globalThis.__documentPipeline.published;
+  assert.equal(published.ideaLinks.length, 1);
+  assert.equal(published.ideaLinks[0].targetKind, 'field');
+  assert.notEqual(published.ideaLinks[0].targetId, 'overview');
+  assert.ok(published.fields.some((field) => field.fieldId === published.ideaLinks[0].targetId));
+});
+
 
 test('a file replaced externally during analysis is rejected at the publication boundary', async () => {
   globalThis.__documentPipeline.sourceReads = 0;
@@ -412,7 +747,7 @@ test('a repeatedly rejected or empty synthesis publishes an explicit literal fal
   assert.equal(result, 'published-v1');
   const published = globalThis.__documentPipeline.published;
   assert.equal(published.profile.fallbackMode, 'extractive');
-  assert.equal(published.audit.passed, true);
+  assert.equal(published.audit.passed, false, 'literal fallback does not impersonate semantic approval');
   assert.equal(published.audit.supportCoverage, 1);
   assert.ok(published.fields.length > 0);
   assert.ok(published.supports.every((support) => support.validationStatus === 'valid'));
@@ -534,7 +869,7 @@ test('provider scores are read as fractions, percentages and comma decimals', ()
   assert.equal(score('sin puntuación'), null);
 });
 
-test('a synthesis the auditor did not approve is published as partial, not thrown away', async () => {
+test('an approved synthesis just below the preferred score publishes as partial', async () => {
   globalThis.__documentPipeline.sourceReads = 0;
   globalThis.__documentPipeline.published = null;
   globalThis.__documentPipeline.text = `# Introducción\n[[p. 1]]\nLa obra plantea su problema.\n## Desarrollo\n[[p. 2]]\nEl proceso avanzó de manera desigual entre las regiones.\n${'Desarrollo histórico completo. '.repeat(100)}`;
@@ -544,8 +879,8 @@ test('a synthesis the auditor did not approve is published as partial, not throw
     light_at:null,light_hash:null,deep_status:'done',deep_at:null,deep_hash:null,summary_status:'none',summary_at:null,
     summary_hash:null,archived:0,notes:null,
   };
-  // One hundredth under the acceptance bar used to replace the whole audited synthesis
-  // with raw quotations.
+  // One hundredth under the preferred score keeps explicitly approved prose while
+  // declaring the lower-confidence publication mode.
   globalThis.__documentPipeline.overrides = { auditScore: 0.79 };
   let result;
   try {
@@ -568,7 +903,7 @@ test('a synthesis the auditor did not approve is published as partial, not throw
   assert.ok(published.supports.every((support) => support.validationStatus === 'valid'));
 });
 
-test('an auditor that rejects the profile still gets its corrections applied', async () => {
+test('an explicitly rejected synthesis degrades to literal extraction', async () => {
   globalThis.__documentPipeline.sourceReads = 0;
   globalThis.__documentPipeline.published = null;
   globalThis.__documentPipeline.text = `# Introducción\n[[p. 1]]\nLa obra plantea su problema.\n## Desarrollo\n[[p. 2]]\nEl proceso avanzó de manera desigual entre las regiones.\n${'Desarrollo histórico completo. '.repeat(100)}`;
@@ -578,8 +913,8 @@ test('an auditor that rejects the profile still gets its corrections applied', a
     light_at:null,light_hash:null,deep_status:'done',deep_at:null,deep_hash:null,summary_status:'none',summary_at:null,
     summary_hash:null,archived:0,notes:null,
   };
-  // The auditor refuses the profile but says exactly which field is wrong and how to fix
-  // it. Those corrections used to be dropped unless the verdict was positive.
+  // Corrections remain useful during repair, but repeated semantic rejection must
+  // never publish the disputed paraphrase merely because its quote is literal.
   globalThis.__documentPipeline.overrides = {
     auditPassed: false,
     auditScore: 0.6,
@@ -596,16 +931,20 @@ test('an auditor that rejects the profile still gets its corrections applied', a
   }
   assert.equal(result, 'published-v1');
   const published = globalThis.__documentPipeline.published;
-  assert.equal(
-    published.fields[0].text, 'Texto corregido por el auditor.',
-    'the correction survives the repair passes that follow a rejected verdict',
+  assert.equal(published.audit.fallback, 'extractive');
+  assert.equal(published.audit.passed, false);
+  assert.equal(published.qualityScore, null,
+    'the rejected synthesis score is never labeled as quality of the extractive replacement');
+  assert.ok(
+    published.fields.every((field) => globalThis.__documentPipeline.text.replace(/\s+/g, ' ').includes(field.text.replace(/\s+/g, ' '))),
+    'every published field is literal source text after semantic rejection',
   );
-  assert.equal(published.supports[0].quote, 'Desarrollo histórico completo.', 'and its literal support is the one the auditor named');
-  assert.equal(published.audit.fallback, 'partial', 'the verdict itself is still reported as not approved');
-  assert.deepEqual(published.audit.issues, ['El apoyo no es literal.']);
+  assert.ok(!published.fields.some((field) => field.text === 'Texto corregido por el auditor.'));
+  assert.ok(published.audit.issues.includes('fallback_extractivo_determinista'));
+  assert.ok(published.audit.issues.includes('El apoyo no es literal.'));
 });
 
-test('a truncated audit is retried with a compact payload instead of discarding the synthesis', async () => {
+test('a truncated full audit retries complete batches instead of truncating evidence', async () => {
   globalThis.__documentPipeline.sourceReads = 0;
   globalThis.__documentPipeline.published = null;
   globalThis.__documentPipeline.auditCalls = 0;
@@ -617,18 +956,20 @@ test('a truncated audit is retried with a compact payload instead of discarding 
     light_at:null,light_hash:null,deep_status:'done',deep_at:null,deep_hash:null,summary_status:'none',summary_at:null,
     summary_hash:null,archived:0,notes:null,
   };
-  // One audit answer hits the output ceiling. That used to end the loop with no verdict
-  // and no repair, which handed the whole synthesis to the extractive fallback.
+  // One audit answer hits the output ceiling. The retry audits complete section units
+  // plus global consistency; it never approves a payload with clipped evidence.
   globalThis.__documentPipeline.auditTruncations = 1;
   const result = await pipeline.runDocumentProfileScan(work, {
     jobId:'job-truncated-audit',generatorModel:null,auditorModel:null,onProgress() {},
   });
   assert.equal(result, 'published-v1');
   const published = globalThis.__documentPipeline.published;
-  assert.equal(globalThis.__documentPipeline.auditCalls, 2, 'the truncated answer is retried, not abandoned');
+  assert.equal(globalThis.__documentPipeline.auditCalls, 4,
+    'the truncated full audit is replaced by two complete section audits and one global audit');
   assert.ok(
-    globalThis.__documentPipeline.auditPayloadChars[1] < globalThis.__documentPipeline.auditPayloadChars[0],
-    `the retry sends a smaller payload (${globalThis.__documentPipeline.auditPayloadChars.join(' then ')})`,
+    globalThis.__documentPipeline.auditPayloadChars.slice(1)
+      .every((chars) => chars < globalThis.__documentPipeline.auditPayloadChars[0]),
+    `batched retries are smaller complete units (${globalThis.__documentPipeline.auditPayloadChars.join(' then ')})`,
   );
   assert.equal(published.audit.fallback, null, 'the retried verdict approves the profile');
   assert.equal(published.audit.passed, true);

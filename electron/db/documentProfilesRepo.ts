@@ -7,6 +7,7 @@ import type {
   DocumentIndexJobStatus,
   DocumentProfile,
   DocumentProfileAudit,
+  DocumentProfileFallbackMode,
   DocumentProfileField,
   DocumentProfileFieldKind,
   DocumentProfileOverride,
@@ -20,6 +21,7 @@ import { getDb } from './database';
 import { currentEmbeddingConfig, embeddingTextHash, encodeEmbedding } from './ideasRepo';
 import type { PassageInsert, SimilarPassage } from './passagesRepo';
 import { scanSimilar } from './vectorScan';
+import { literalSourceSpanMatches, textCanonicallyContainsLiteral } from '../extraction/sourceTextRanges';
 
 const json = <T>(value: unknown, fallback: T): T => {
   try { return value == null ? fallback : JSON.parse(String(value)) as T; } catch { return fallback; }
@@ -43,6 +45,7 @@ interface ProfileVersionRow {
   published_at: string | null;
   status: DocumentUnderstandingState;
   stale_reason: string | null;
+  error: string | null;
 }
 
 export interface PublishDocumentProfileInput {
@@ -58,6 +61,8 @@ export interface PublishDocumentProfileInput {
   fields: Array<Omit<DocumentProfileField, 'fieldId'> & { fieldId?: string }>;
   sections: DocumentSection[];
   supports: DocumentProfileSupport[];
+  /** Exact resolved marked source used to validate every published support range. */
+  resolvedText?: string;
   ideaLinks?: DocumentIdeaLink[];
   vectors: Array<{
     vectorId?: string;
@@ -97,6 +102,45 @@ export interface PublishDocumentProfileInput {
     embeddingProvider?: string;
     embeddingModel?: string;
   } | null;
+}
+
+export class DocumentProfilePublicationError extends Error {
+  readonly code = 'publish_failed';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'DocumentProfilePublicationError';
+  }
+}
+
+/** One publication contract for both the AI pipeline and the persistence boundary.
+ * Invalid or absent coverage never becomes publishable through numeric coercion. */
+export function documentProfileAuditAllowsPublication(audit: DocumentProfileAudit): boolean {
+  const supportCoverage = Number(audit.supportCoverage);
+  const structureCoverage = Number(audit.structureCoverage);
+  if (!Number.isFinite(supportCoverage) || !Number.isFinite(structureCoverage)) return false;
+  const deterministicComplete = supportCoverage === 1 && structureCoverage >= 0.95;
+  return deterministicComplete && (
+    audit.passed
+    || audit.fallback === 'partial'
+    || audit.fallback === 'extractive'
+  );
+}
+
+function versionOwnedId(versionId: string, kind: 'field' | 'section' | 'support' | 'vector', logicalId: string): string {
+  return `${versionId}:${kind}:${logicalId}`;
+}
+
+function requireVersionOwnedId(
+  ids: Map<string, string>,
+  logicalId: string,
+  kind: 'field' | 'section',
+): string {
+  const materialized = ids.get(logicalId);
+  if (!materialized) {
+    throw new DocumentProfilePublicationError(`La ficha referencia un ${kind} que no pertenece a la versión candidata.`);
+  }
+  return materialized;
 }
 
 function fieldRow(row: Record<string, unknown>): DocumentProfileField {
@@ -145,6 +189,8 @@ function supportRow(row: Record<string, unknown>): DocumentProfileSupport {
     sourceRef: row.source_ref == null ? null : String(row.source_ref),
     pageStartNumber: row.page_start_number == null ? null : Number(row.page_start_number),
     pageEndNumber: row.page_end_number == null ? null : Number(row.page_end_number),
+    charStart: row.char_start == null ? null : Number(row.char_start),
+    charEnd: row.char_end == null ? null : Number(row.char_end),
     quote: String(row.quote),
     supportKind: String(row.support_kind),
     confidence: Number(row.confidence),
@@ -215,9 +261,32 @@ function restoreDocumentProfileStateAfterCancellation(nodusId: string): void {
   ).run(new Date().toISOString(), nodusId);
 }
 
+/** A failed refresh must not hide the last committed profile. Profile freshness is
+ * derived from the source fingerprint that the failed job actually read; the job row
+ * remains the authoritative terminal outcome and `error` remains visible in the UI. */
+export function restoreDocumentProfileStateAfterFailure(
+  nodusId: string,
+  error: string,
+  failedSourceFingerprint: string | null,
+): void {
+  ensureDocumentProfileState(nodusId);
+  getDb().prepare(
+    `UPDATE document_profile_state SET
+       status=CASE
+         WHEN current_version_id IS NULL THEN 'failed'
+         WHEN stale_reason IS NOT NULL THEN 'stale'
+         WHEN ? IS NOT NULL AND source_fingerprint<>? THEN 'stale'
+         ELSE 'current'
+       END,
+       error=?,
+       updated_at=?
+     WHERE nodus_id=?`
+  ).run(failedSourceFingerprint, failedSourceFingerprint, error, new Date().toISOString(), nodusId);
+}
+
 export function getDocumentProfile(nodusId: string): DocumentProfile | null {
   const row = getDb().prepare(
-    `SELECT v.*, s.status, s.stale_reason
+    `SELECT v.*, s.status, s.stale_reason, s.error
        FROM document_profile_state s
        JOIN document_profile_versions v ON v.version_id=s.current_version_id
       WHERE s.nodus_id=?`
@@ -281,6 +350,7 @@ export function getDocumentProfile(nodusId: string): DocumentProfile | null {
     createdAt: row.created_at,
     publishedAt: row.published_at,
     staleReason: row.stale_reason,
+    refreshError: row.error,
   };
 }
 
@@ -360,9 +430,103 @@ function refreshDocumentProfileFts(nodusId: string): void {
     .run(nodusId, profile.versionId, title, profile.overview, profile.fields.map((field) => field.text).join('\n'));
 }
 
+function documentPublicationFingerprint(input: PublishDocumentProfileInput): string {
+  const payload = {
+    profile: input.profile,
+    overview: input.overview,
+    fields: input.fields,
+    sections: input.sections,
+    supports: input.supports.map((support) => ({
+      targetKind: support.targetKind,
+      targetId: support.targetId,
+      sectionId: support.sectionId,
+      passageId: support.passageId,
+      pageStart: support.pageStart,
+      pageEnd: support.pageEnd,
+      sourceRef: support.sourceRef,
+      pageStartNumber: support.pageStartNumber,
+      pageEndNumber: support.pageEndNumber,
+      charStart: support.charStart,
+      charEnd: support.charEnd,
+      quote: support.quote,
+      supportKind: support.supportKind,
+      confidence: support.confidence,
+      validationStatus: support.validationStatus,
+    })),
+    ideaLinks: input.ideaLinks ?? [],
+    vectors: input.vectors.map((vector) => ({
+      kind: vector.kind,
+      sourceId: vector.sourceId,
+      text: vector.text,
+      weight: vector.weight,
+      embeddingProvider: vector.embeddingProvider ?? null,
+      embeddingModel: vector.embeddingModel ?? null,
+      embeddingHash: vector.embedding
+        ? createHash('sha256').update(JSON.stringify(vector.embedding)).digest('hex')
+        : null,
+    })),
+    audit: input.audit,
+    qualityScore: input.qualityScore,
+  };
+  return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+}
+function assertSupportEvidenceIntegrity(input: PublishDocumentProfileInput): void {
+  const valid = input.supports.filter((support) => support.validationStatus === 'valid');
+  if (valid.length === 0) return;
+  if (input.resolvedText == null) {
+    throw new DocumentProfilePublicationError('La ficha no incluye el texto resuelto necesario para validar sus apoyos.');
+  }
+  const staged = input.passages
+    ? new Map(input.passages.rows.map((row, index) => [
+      `${input.nodusId}#${index}`,
+      { nodus_id: input.nodusId, text: row.text, source_ref: row.sourceRef ?? null },
+    ]))
+    : null;
+  const persisted = staged ? null : getDb().prepare(
+    'SELECT nodus_id,text,source_ref FROM passages WHERE passage_id=?'
+  );
+  for (const support of valid) {
+    const charStart = support.charStart;
+    const charEnd = support.charEnd;
+    if (
+      charStart == null
+      || charEnd == null
+      || !Number.isInteger(charStart)
+      || !Number.isInteger(charEnd)
+      || charStart < 0
+      || charEnd <= charStart
+      || !literalSourceSpanMatches(input.resolvedText, support.quote, charStart, charEnd)
+    ) {
+      throw new DocumentProfilePublicationError('La ficha contiene un apoyo cuya cita no coincide con su rango de origen.');
+    }
+    if (support.passageId == null) continue;
+    const passage = staged
+      ? staged.get(support.passageId)
+      : persisted!.get(support.passageId) as {
+        nodus_id: string; text: string; source_ref: string | null;
+      } | undefined;
+    if (
+      !passage
+      || passage.nodus_id !== input.nodusId
+      || passage.source_ref !== (support.sourceRef ?? null)
+      || !textCanonicallyContainsLiteral(passage.text, support.quote)
+    ) {
+      throw new DocumentProfilePublicationError('La ficha contiene un enlace de pasaje que no ancla literalmente su apoyo.');
+    }
+  }
+}
+
+
 /** Publish a complete candidate in one transaction; nothing partial becomes readable. */
 export function publishDocumentProfile(input: PublishDocumentProfileInput): string {
-  if (!input.audit.passed) throw new Error('No se puede publicar una ficha que no superó la auditoría.');
+  if (!documentProfileAuditAllowsPublication(input.audit)) {
+    const metric = (value: unknown): string => Number.isFinite(Number(value)) ? Number(value).toFixed(2) : 'invalid';
+    throw new DocumentProfilePublicationError(
+      `La ficha no cumple el contrato de publicación: modo=${input.audit.fallback ?? 'synthesis'} · `
+      + `veredicto=${input.audit.passed ? 'aprobado' : 'rechazado'} · `
+      + `apoyos=${metric(input.audit.supportCoverage)} · estructura=${metric(input.audit.structureCoverage)}`,
+    );
+  }
   const db = getDb();
   if (input.expectedWorkRevision) {
     const work = db.prepare(
@@ -387,7 +551,8 @@ export function publishDocumentProfile(input: PublishDocumentProfileInput): stri
       throw new Error('DOCUMENT_SOURCE_CHANGED');
     }
   }
-  const profileFingerprint = createHash('sha256').update(JSON.stringify(input.profile)).digest('hex');
+  assertSupportEvidenceIntegrity(input);
+  const profileFingerprint = documentPublicationFingerprint(input);
   const current = db.prepare(
     `SELECT s.current_version_id,s.source_fingerprint,s.pipeline_version,s.profile_fingerprint,
             v.prompt_hash,v.generator_model_json,v.auditor_model_json
@@ -403,6 +568,16 @@ export function publishDocumentProfile(input: PublishDocumentProfileInput): stri
     generator_model_json: string | null;
     auditor_model_json: string | null;
   } | undefined;
+  const candidateValidSupports = input.supports.filter((support) => support.validationStatus === 'valid');
+  const currentSupportCounts = current?.current_version_id
+    ? db.prepare(
+      `SELECT COUNT(*) AS valid_supports,
+              SUM(CASE WHEN passage_id IS NOT NULL THEN 1 ELSE 0 END) AS linked_supports
+         FROM document_profile_support
+        WHERE version_id=? AND validation_status='valid'`
+    ).get(current.current_version_id) as { valid_supports: number; linked_supports: number | null }
+    : null;
+  const candidateLinkedSupports = candidateValidSupports.filter((support) => support.passageId != null).length;
   const sameModel = (stored: string | null, model: ModelRef | null): boolean =>
     stored === (model ? JSON.stringify(model) : null);
   if (
@@ -413,6 +588,8 @@ export function publishDocumentProfile(input: PublishDocumentProfileInput): stri
     && current.prompt_hash === input.promptHash
     && sameModel(current.generator_model_json, input.generatorModel)
     && sameModel(current.auditor_model_json, input.auditorModel)
+    && Number(currentSupportCounts?.valid_supports ?? -1) === candidateValidSupports.length
+    && Number(currentSupportCounts?.linked_supports ?? 0) === candidateLinkedSupports
   ) {
     // Crash replay after the atomic publication but before the queue acknowledgement:
     // return the already-current version instead of manufacturing a superseded twin.
@@ -427,6 +604,54 @@ export function publishDocumentProfile(input: PublishDocumentProfileInput): stri
   const versionId = input.versionId ?? randomUUID();
   const now = new Date().toISOString();
   const config = input.vectors.some((vector) => vector.embedding) ? currentEmbeddingConfig() : null;
+  // Logical ids are stable while analysing a document; stored ids belong to one
+  // immutable version. Namespacing at the publication boundary preserves both
+  // properties and lets unchanged sections/fields coexist across profile history.
+  const fieldIds = new Map<string, string>();
+  const fields = input.fields.map((field) => {
+    const logicalId = field.fieldId ?? randomUUID();
+    const fieldId = versionOwnedId(versionId, 'field', logicalId);
+    fieldIds.set(logicalId, fieldId);
+    return { ...field, fieldId };
+  });
+  const sectionIds = new Map(
+    input.sections.map((section) => [
+      section.sectionId,
+      versionOwnedId(versionId, 'section', section.sectionId),
+    ]),
+  );
+  const sections = input.sections.map((section) => ({
+    ...section,
+    sectionId: requireVersionOwnedId(sectionIds, section.sectionId, 'section'),
+    parentSectionId: section.parentSectionId == null
+      ? null
+      : requireVersionOwnedId(sectionIds, section.parentSectionId, 'section'),
+  }));
+  const supports = input.supports.map((support) => ({
+    ...support,
+    supportId: versionOwnedId(versionId, 'support', support.supportId),
+    targetId: support.targetKind === 'field'
+      ? requireVersionOwnedId(fieldIds, support.targetId, 'field')
+      : requireVersionOwnedId(sectionIds, support.targetId, 'section'),
+    sectionId: support.sectionId == null
+      ? null
+      : requireVersionOwnedId(sectionIds, support.sectionId, 'section'),
+  }));
+  const vectors = input.vectors.map((vector) => ({
+    ...vector,
+    vectorId: versionOwnedId(versionId, 'vector', vector.vectorId ?? randomUUID()),
+    sourceId: vector.sourceId == null || vector.kind === 'overview'
+      ? vector.sourceId
+      : vector.kind === 'section'
+        ? requireVersionOwnedId(sectionIds, vector.sourceId, 'section')
+        : requireVersionOwnedId(fieldIds, vector.sourceId, 'field'),
+  }));
+  const ideaLinks = (input.ideaLinks ?? []).map((link) => ({
+    ...link,
+    targetId: link.targetKind === 'field'
+      ? requireVersionOwnedId(fieldIds, link.targetId, 'field')
+      : requireVersionOwnedId(sectionIds, link.targetId, 'section'),
+  }));
   db.transaction(() => {
     ensureDocumentProfileState(input.nodusId);
     const previous = db.prepare(
@@ -451,8 +676,8 @@ export function publishDocumentProfile(input: PublishDocumentProfileInput): stri
       `INSERT INTO document_profile_fields(field_id,version_id,nodus_id,kind,ordinal,text,confidence,centrality,confidence_source,created_at)
        VALUES(?,?,?,?,?,?,?,?,?,?)`
     );
-    for (const field of input.fields) insertField.run(
-      field.fieldId ?? randomUUID(), versionId, input.nodusId, field.kind, field.ordinal,
+    for (const field of fields) insertField.run(
+      field.fieldId, versionId, input.nodusId, field.kind, field.ordinal,
       field.text, clamp01(field.confidence), clamp01(field.centrality), field.confidenceSource ?? 'model', now
     );
     const insertSection = db.prepare(
@@ -462,7 +687,7 @@ export function publishDocumentProfile(input: PublishDocumentProfileInput): stri
          char_start,char_end,content_hash,created_at
        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     );
-    for (const section of input.sections) insertSection.run(
+    for (const section of sections) insertSection.run(
       section.sectionId, versionId, input.nodusId, section.parentSectionId, section.level,
       section.ordinal, section.title, section.role, section.summary, JSON.stringify(section.concepts),
       JSON.stringify(section.claims), section.pageStart, section.pageEnd, section.sourceRef ?? null,
@@ -470,6 +695,9 @@ export function publishDocumentProfile(input: PublishDocumentProfileInput): stri
       section.charEnd, section.contentHash, now
     );
     if (input.passages) {
+      // Stable chunk ids are recycled by replacement. Historical/current links
+      // must not silently attach to different passage bytes under the same id.
+      db.prepare('UPDATE document_profile_support SET passage_id=NULL WHERE nodus_id=?').run(input.nodusId);
       const passageConfig = currentEmbeddingConfig();
       const insertPassage = db.prepare(
         `INSERT INTO passages(
@@ -499,10 +727,10 @@ export function publishDocumentProfile(input: PublishDocumentProfileInput): stri
          support_kind,confidence,validation_status,created_at
        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     );
-    for (const support of input.supports) insertSupport.run(
+    for (const support of supports) insertSupport.run(
       support.supportId, versionId, input.nodusId, support.targetKind, support.targetId,
       support.sectionId, support.passageId, support.pageStart, support.pageEnd, support.sourceRef ?? null,
-      support.pageStartNumber ?? null, support.pageEndNumber ?? null, null, null,
+      support.pageStartNumber ?? null, support.pageEndNumber ?? null, support.charStart, support.charEnd,
       support.quote, createHash('sha256').update(support.quote).digest('hex'), support.supportKind,
       clamp01(support.confidence), support.validationStatus, now
     );
@@ -512,8 +740,8 @@ export function publishDocumentProfile(input: PublishDocumentProfileInput): stri
          embedding_provider,embedding_model,embedding_dim,created_at
        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
     );
-    for (const vector of input.vectors) insertVector.run(
-      vector.vectorId ?? randomUUID(), input.nodusId, versionId, vector.kind, vector.sourceId,
+    for (const vector of vectors) insertVector.run(
+      vector.vectorId, input.nodusId, versionId, vector.kind, vector.sourceId,
       vector.text, createHash('sha256').update(vector.text).digest('hex'), vector.weight,
       vector.embedding ? encodeEmbedding(vector.embedding) : null,
       vector.embedding ? (vector.embeddingProvider ?? config?.provider) : null,
@@ -524,7 +752,7 @@ export function publishDocumentProfile(input: PublishDocumentProfileInput): stri
       `INSERT INTO document_idea_links(version_id,nodus_id,global_id,target_kind,target_id,role,score,created_at)
        VALUES(?,?,?,?,?,?,?,?)`
     );
-    for (const link of input.ideaLinks ?? []) insertLink.run(
+    for (const link of ideaLinks) insertLink.run(
       versionId, input.nodusId, link.globalId, link.targetKind, link.targetId, link.role, clamp01(link.score), now
     );
     const generatedByPath = new Map<string, unknown>([
@@ -532,9 +760,10 @@ export function publishDocumentProfile(input: PublishDocumentProfileInput): stri
       ...input.fields.map((field) => [`fields.${field.kind}.${field.ordinal}`, field.text] as [string, unknown]),
     ]);
     const existingOverrides = db.prepare(
-      'SELECT override_id, field_path, generated_value_json, base_version_id FROM document_profile_overrides WHERE nodus_id=?'
+      'SELECT override_id, field_path, generated_value_json, value_json, base_version_id FROM document_profile_overrides WHERE nodus_id=?'
     ).all(input.nodusId) as Array<{
-      override_id: string; field_path: string; generated_value_json: string | null; base_version_id: string | null;
+      override_id: string; field_path: string; generated_value_json: string | null;
+      value_json: string; base_version_id: string | null;
     }>;
     const markConflict = db.prepare('UPDATE document_profile_overrides SET conflict=?, updated_at=? WHERE override_id=?');
     for (const override of existingOverrides) {
@@ -559,18 +788,25 @@ export function publishDocumentProfile(input: PublishDocumentProfileInput): stri
     );
     db.prepare('DELETE FROM document_profiles_fts WHERE nodus_id=?').run(input.nodusId);
     const title = (db.prepare('SELECT title FROM works WHERE nodus_id=?').get(input.nodusId) as { title: string } | undefined)?.title ?? '';
+    const overrideValues = new Map(existingOverrides.map((override) => [override.field_path, json(override.value_json, null)]));
+    const effectiveOverview = typeof overrideValues.get('overview') === 'string'
+      ? String(overrideValues.get('overview'))
+      : input.overview;
+    const effectiveFields = fields.map((field) => {
+      const value = overrideValues.get(`fields.${field.kind}.${field.ordinal}`);
+      return typeof value === 'string' ? value : field.text;
+    });
     db.prepare(
       'INSERT INTO document_profiles_fts(nodus_id,version_id,title,overview,fields) VALUES(?,?,?,?,?)'
-    ).run(input.nodusId, versionId, title, input.overview, input.fields.map((field) => field.text).join('\n'));
+    ).run(input.nodusId, versionId, title, effectiveOverview, effectiveFields.join('\n'));
     db.prepare('DELETE FROM document_sections_fts WHERE nodus_id=?').run(input.nodusId);
     const ftsSection = db.prepare(
       'INSERT INTO document_sections_fts(section_id,nodus_id,title,summary,concepts) VALUES(?,?,?,?,?)'
     );
-    for (const section of input.sections) ftsSection.run(
+    for (const section of sections) ftsSection.run(
       section.sectionId, input.nodusId, section.title, section.summary, section.concepts.join(' ')
     );
   })();
-  refreshDocumentProfileFts(input.nodusId);
   return versionId;
 }
 
@@ -621,9 +857,12 @@ export async function findSimilarDocuments(
   const scores = new Map(ranked.map((item) => [item.vector_id, item.similarity]));
   const rows = getDb().prepare(
     `SELECT dv.vector_id,dv.nodus_id,dv.version_id,dv.kind,dv.source_id,dv.text,dv.weight,
-            w.title,w.authors_json,w.year,dps.status
+            w.title,w.authors_json,w.year,dps.status,
+            json_extract(v.audit_json,'$.fallback') profile_fallback,
+            json_extract(v.audit_json,'$.passed') semantic_passed
        FROM document_vectors dv JOIN works w ON w.nodus_id=dv.nodus_id
        JOIN document_profile_state dps ON dps.nodus_id=dv.nodus_id AND dps.current_version_id=dv.version_id
+       JOIN document_profile_versions v ON v.version_id=dv.version_id
       WHERE dv.vector_id IN (${ranked.map(() => '?').join(',')})`
   ).all(...ranked.map((item) => item.vector_id)) as Record<string, unknown>[];
   const bestBySource = new Map<string, DocumentSearchHit>();
@@ -639,6 +878,8 @@ export async function findSimilarDocuments(
       similarity, centrality: Number(row.weight ?? 1),
       explanation: `Coincidencia en ${String(row.kind).replaceAll('_', ' ')}`,
       stale: String(row.status) === 'stale',
+      profileFallback: row.profile_fallback == null ? null : row.profile_fallback as DocumentProfileFallbackMode,
+      semanticPassed: row.semantic_passed == null ? null : Boolean(row.semantic_passed),
     };
     if (!bestBySource.has(key) || (bestBySource.get(key)?.similarity ?? 0) < similarity) bestBySource.set(key, hit);
   }
@@ -656,9 +897,12 @@ export function lexicalDocumentSearch(query: string, limit = 20, opts: { nodusId
   if (!ftsQuery) return [];
   const rows = getDb().prepare(
     `SELECT f.nodus_id,f.version_id,f.title,f.overview,bm25(document_profiles_fts) rank,
-            w.authors_json,w.year,s.status
+            w.authors_json,w.year,s.status,
+            json_extract(v.audit_json,'$.fallback') profile_fallback,
+            json_extract(v.audit_json,'$.passed') semantic_passed
        FROM document_profiles_fts f JOIN works w ON w.nodus_id=f.nodus_id
        JOIN document_profile_state s ON s.current_version_id=f.version_id
+       JOIN document_profile_versions v ON v.version_id=f.version_id
       WHERE document_profiles_fts MATCH ? AND w.archived=0${scoped} ORDER BY rank LIMIT ?`
   ).all(ftsQuery, ...(opts.nodusIds ? [JSON.stringify(opts.nodusIds)] : []), limit) as Record<string, unknown>[];
   return rows.map((row) => ({
@@ -667,6 +911,8 @@ export function lexicalDocumentSearch(query: string, limit = 20, opts: { nodusId
     versionId: String(row.version_id), sourceId: String(row.version_id), fieldKind: 'lexical',
     text: String(row.overview), similarity: 0, lexicalScore: -Number(row.rank), centrality: 1,
     explanation: 'Coincidencia léxica en la ficha documental', stale: String(row.status) === 'stale',
+    profileFallback: row.profile_fallback == null ? null : row.profile_fallback as DocumentProfileFallbackMode,
+    semanticPassed: row.semantic_passed == null ? null : Boolean(row.semantic_passed),
   }));
 }
 
@@ -684,29 +930,47 @@ export function findDocumentSupportPassages(
   const exactHits = hits.filter((hit) => hit.sourceId && !['overview', 'lexical'].includes(hit.fieldKind));
   if (exactHits.length === 0) return [];
   const statement = getDb().prepare(
-    `SELECT p.passage_id,p.nodus_id,p.text,p.page_label,
-            w.title,w.authors_json,w.year,w.zotero_key,s.confidence
+    `SELECT p.passage_id,p.nodus_id,p.text,p.page_label,p.source_ref,p.page_number,
+            w.title,w.authors_json,w.year,w.zotero_key,s.confidence,s.quote,
+            s.source_ref AS support_source_ref
        FROM document_profile_support s
+       JOIN document_profile_state state ON state.nodus_id=s.nodus_id AND state.current_version_id=s.version_id
        JOIN passages p ON p.passage_id=s.passage_id AND p.nodus_id=s.nodus_id
        JOIN works w ON w.nodus_id=s.nodus_id
       WHERE s.version_id=? AND s.target_id=? AND s.validation_status='valid'
         AND s.passage_id IS NOT NULL AND w.archived=0
         AND ((w.resolved_text_hash IS NOT NULL AND p.content_hash=w.resolved_text_hash)
           OR (w.resolved_text_hash IS NULL AND (w.deep_hash IS NULL OR p.content_hash=w.deep_hash)))
-      ORDER BY s.confidence DESC,s.support_id
-      LIMIT ?`
+      ORDER BY s.confidence DESC,s.support_id`
   );
+  type SupportPassageRow = Omit<SimilarPassage, 'similarity'> & {
+    confidence: number;
+    quote: string;
+    support_source_ref: string | null;
+  };
   const passages = new Map<string, SimilarPassage>();
   for (const hit of exactHits) {
-    const rows = statement.all(hit.versionId, hit.sourceId, perHit) as Array<Omit<SimilarPassage, 'similarity'> & { confidence: number }>;
+    const rows = statement.all(hit.versionId, hit.sourceId) as SupportPassageRow[];
+    let acceptedForHit = 0;
     for (const row of rows) {
+      if (
+        row.source_ref !== row.support_source_ref
+        || !textCanonicallyContainsLiteral(row.text, row.quote)
+      ) continue;
       const similarity = clamp01(Math.max(0, hit.similarity) * clamp01(row.confidence));
       const previous = passages.get(row.passage_id);
       if (!previous || previous.similarity < similarity) {
-        const { confidence: _confidence, ...passage } = row;
+        const {
+          confidence: _confidence,
+          quote: _quote,
+          support_source_ref: _supportSourceRef,
+          ...passage
+        } = row;
         passages.set(row.passage_id, { ...passage, similarity });
       }
+      acceptedForHit += 1;
       if (passages.size >= limit) return [...passages.values()];
+      if (acceptedForHit >= perHit) break;
     }
   }
   return [...passages.values()];

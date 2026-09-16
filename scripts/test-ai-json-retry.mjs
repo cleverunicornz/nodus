@@ -30,7 +30,8 @@ installRuntimeHooks(root);
 
 /**
  * Replies for /v1/chat/completions, consumed in order; every hit is recorded.
- * A reply may be a bare string, or `{ content, finish_reason }` to model truncation.
+ * A reply may be a bare string, or an object carrying `content`, `finish_reason`
+ * and optional `tool_calls` to model provider-specific structured output.
  */
 let queue = [];
 let seen = [];
@@ -46,7 +47,12 @@ const server = createServer((req, res) => {
     const next = queue.shift() ?? '{}';
     const reply = typeof next === 'string' ? { content: next, finish_reason: 'stop' } : next;
     res.writeHead(200, { 'content-type': 'application/json' });
-    const payload = JSON.stringify({ choices: [{ message: { role: 'assistant', content: reply.content }, finish_reason: reply.finish_reason }] });
+    const payload = JSON.stringify({
+      choices: [{
+        message: { role: 'assistant', content: reply.content, ...(reply.tool_calls ? { tool_calls: reply.tool_calls } : {}) },
+        finish_reason: reply.finish_reason,
+      }],
+    });
     if (reply.bodyDelayMs) {
       // Reproduce the SDK edge case: headers arrive within its timeout, while the
       // response body remains pending beyond the complete-operation deadline.
@@ -153,6 +159,25 @@ try {
   assert.deepEqual((await aiClient.completeJson(opts, guard, model)).ideas, ['recovered']);
   assert.equal(seen.length, 2, 'an explicit empty backend failure is retried once');
   assert.deepEqual(seen[1].body, seen[0].body, 'the provider-error retry preserves request identity');
+
+  // 5d. The request declared no tools. A provider tool-call envelope is therefore
+  // rejected without executing or reinterpreting its arguments, even when those
+  // arguments happen to match the requested JSON schema.
+  for (const tool_calls of [
+    [{ id: 'call-1', type: 'function', function: { name: 'structured_output', arguments: '{"ideas":["must not be accepted"]}' } }],
+    [
+      { id: 'call-1', type: 'function', function: { name: 'first', arguments: '{"ideas":["a"]}' } },
+      { id: 'call-2', type: 'function', function: { name: 'second', arguments: '{"ideas":["b"]}' } },
+    ],
+  ]) {
+    run([{ content: '', finish_reason: 'tool_calls', tool_calls }, '{"ideas":["never reached"]}']);
+    await assert.rejects(() => aiClient.completeJson(opts, guard, model), (error) => {
+      assert.equal(error.code, 'bad_request');
+      assert.match(error.message, /no solicitó/i);
+      return true;
+    });
+    assert.equal(seen.length, 1, 'an unsolicited tool call fails without a paid replay');
+  }
 
   // 6. Prose is not JSON: a clipped sentence is still usable, so plain text must survive
   //    truncation untouched rather than inheriting the JSON guard.
@@ -282,8 +307,25 @@ try {
   });
   assert.equal(gemini3.config.temperature, undefined, 'Gemini 3 keeps provider sampling defaults');
 
+  // 11. Approval-required mode fails before any remote/custom transport reaches
+  // the wire. This is the canary harness's independent no-approval safety net.
+  process.env.NODUS_REQUIRE_AI_APPROVAL = '1';
+  delete process.env.NODUS_AI_APPROVAL_JSON;
+  delete process.env.NODUS_AI_APPROVAL_LEDGER;
+  run(['{"ideas":["must never be requested"]}']);
+  await assert.rejects(() => aiClient.completeJson(opts, guard, thinkingModel), (error) => {
+    assert.equal(error.code, 'auth');
+    assert.match(error.message, /aprobación de gasto/i);
+    return true;
+  });
+  assert.equal(seen.length, 0, 'missing approval blocks before provider dispatch');
+  delete process.env.NODUS_REQUIRE_AI_APPROVAL;
+
   console.log('AI JSON retry budget verified.');
 } finally {
+  delete process.env.NODUS_REQUIRE_AI_APPROVAL;
+  delete process.env.NODUS_AI_APPROVAL_JSON;
+  delete process.env.NODUS_AI_APPROVAL_LEDGER;
   try { closeDb(); } catch { /* database may not have opened */ }
   server.close();
   await rm(root, { recursive: true, force: true });

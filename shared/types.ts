@@ -1006,6 +1006,9 @@ export interface DocumentProfileSupport {
   sourceRef?: string | null;
   pageStartNumber?: number | null;
   pageEndNumber?: number | null;
+  /** Zero-based, half-open UTF-16 offsets into the resolved marked source. */
+  charStart: number | null;
+  charEnd: number | null;
   quote: string;
   supportKind: string;
   confidence: number;
@@ -1035,8 +1038,8 @@ export interface DocumentIdeaLink {
 export type DocumentProfileFallbackMode = 'extractive' | 'partial';
 
 export interface DocumentProfileAudit {
-  /** The semantic verdict: whether the auditor approved the synthesis. A profile can
-   *  be published with `passed: false` when it is marked `partial`. */
+  /** Whether the published synthesis cleared semantic review. `partial` and
+   * `extractive` profiles remain explicitly degraded rather than impersonating approval. */
   passed: boolean;
   /** null when the provider reported no usable score: "no reading", not "zero". */
   score: number | null;
@@ -1075,6 +1078,8 @@ export interface DocumentProfile {
   createdAt: string;
   publishedAt: string | null;
   staleReason: string | null;
+  /** Latest refresh failure, retained while the previous committed profile stays readable. */
+  refreshError?: string | null;
 }
 
 export interface DocumentProfileOverride {
@@ -1165,6 +1170,9 @@ export interface DocumentSearchHit {
   centrality: number;
   explanation: string;
   stale: boolean;
+  /** How the current profile was published; consumers must not treat degraded prose as approved synthesis. */
+  profileFallback?: DocumentProfileFallbackMode | null;
+  semanticPassed?: boolean | null;
 }
 
 /** A Zotero tag available in the local library, with its current work count. */
@@ -4873,6 +4881,16 @@ export interface LiveRelationsResult {
 
 export type ExtractStrategy = 'zotero_fulltext' | 'digital' | 'hybrid' | 'scanned' | 'empty';
 
+export interface ExtractionControlDiagnostics {
+  replacements: number;
+  preexistingReplacementCharacters: number;
+  pages?: Array<{
+    page: number;
+    replacements: number;
+    preexistingReplacementCharacters: number;
+  }>;
+}
+
 export interface PdfAnalysis {
   pageCount: number;
   sampledPages: number;
@@ -4880,6 +4898,7 @@ export interface PdfAnalysis {
   textCoverage: number; // 0..1 ratio of sampled pages with a usable text layer
   avgCharsPerTextPage: number;
   strategy: ExtractStrategy;
+  controlDiagnostics?: ExtractionControlDiagnostics;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

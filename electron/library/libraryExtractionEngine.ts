@@ -15,7 +15,13 @@ import type {
 import { openPdf, loadPdfjs } from '../extraction/pdfjsLoader';
 import { ocrPdfPages } from '../extraction/ocr';
 import { csvFileToText, xlsxFileToText } from '../extraction/tabular';
-import { cleanInlineText, dehyphenatingJoin } from '../extraction/textCleanup';
+import {
+  cleanInlineText,
+  dehyphenatingJoin,
+  mergeControlDiagnostics,
+  replaceDisallowedControls,
+  type ExtractionControlDiagnostics,
+} from '../extraction/textCleanup';
 import { atomicWriteFile, atomicWriteJson, assertInside, resolveLibraryFile, safeLibraryFolderName } from './libraryFileUtils';
 import { LibraryDiskStore } from './libraryStorage';
 import {
@@ -73,6 +79,7 @@ interface PageLayout {
   height: number;
   lines: LayoutLine[];
   ocr?: boolean;
+  controlDiagnostics: ExtractionControlDiagnostics;
 }
 
 export interface LibraryExtractionResult {
@@ -210,15 +217,22 @@ async function pageLayout(page: any, number: number): Promise<PageLayout> {
   const viewport = page.getViewport({ scale: 1 });
   const content = await page.getTextContent({ includeMarkedContent: true });
   const positioned: PositionedItem[] = [];
+  let controlDiagnostics: ExtractionControlDiagnostics = {
+    replacements: 0,
+    preexistingReplacementCharacters: 0,
+  };
   for (const raw of content.items ?? []) {
-    if (typeof raw?.str !== 'string' || !raw.str.trim() || !Array.isArray(raw.transform)) continue;
+    if (typeof raw?.str !== 'string' || !Array.isArray(raw.transform)) continue;
+    const sanitized = replaceDisallowedControls(raw.str);
+    controlDiagnostics = mergeControlDiagnostics(controlDiagnostics, sanitized.diagnostics);
+    if (!sanitized.text.trim()) continue;
     const x0 = Number(raw.transform[4]) || 0;
     const baseline = Number(raw.transform[5]) || 0;
     const size = Math.max(1, Math.abs(Number(raw.transform[3]) || Number(raw.height) || 10));
-    const normalizedLength = Math.max(1, [...raw.str.normalize('NFC')].length);
+    const normalizedLength = Math.max(1, [...sanitized.text.normalize('NFC')].length);
     const width = Math.max(0, Number(raw.width) || normalizedLength * size * 0.45);
     positioned.push({
-      text: raw.str, x0, x1: x0 + width,
+      text: sanitized.text, x0, x1: x0 + width,
       top: viewport.height - baseline - size,
       bottom: viewport.height - baseline + size * 0.25,
       size, baseline: viewport.height - baseline,
@@ -242,7 +256,7 @@ async function pageLayout(page: any, number: number): Promise<PageLayout> {
     top: Math.min(...items.map((entry) => entry.top)), bottom: Math.max(...items.map((entry) => entry.bottom)),
     size: median(items.map((entry) => entry.size)), items: [...items].sort((a, b) => a.x0 - b.x0),
   })).filter((line) => line.text);
-  return { page: number, width: viewport.width, height: viewport.height, lines };
+  return { page: number, width: viewport.width, height: viewport.height, lines, controlDiagnostics };
 }
 
 function repeatedChrome(pages: PageLayout[]): Set<string> {
@@ -1071,7 +1085,13 @@ async function pdfBlocks(
   onProgress?: LibraryExtractionProgressHandler,
   signal?: AbortSignal,
   remoteOcr?: LibraryRemoteOcr,
-): Promise<{ blocks: OutputBlock[]; pages: LibrarySourceMap['pages']; ocrPages: number; blankPages: number }> {
+): Promise<{
+  blocks: OutputBlock[];
+  pages: LibrarySourceMap['pages'];
+  ocrPages: number;
+  blankPages: number;
+  controlDiagnostics: ExtractionControlDiagnostics & { pages: number[] };
+}> {
   const pdf = await openPdf(source);
   const layouts: PageLayout[] = [];
   const blank: number[] = [];
@@ -1097,13 +1117,22 @@ async function pdfBlocks(
           const layout = layouts[pageNumber - 1];
           const scaleX = layout.width / Math.max(1, result.width);
           const scaleY = layout.height / Math.max(1, result.height);
-          layout.lines = result.lines.map((line) => ({
-            text: cleanInlineText(line.text), page: pageNumber,
-            x0: line.bbox.x0 * scaleX, x1: line.bbox.x1 * scaleX,
-            top: line.bbox.y0 * scaleY, bottom: line.bbox.y1 * scaleY,
-            size: Math.max(1, line.fontSize * scaleY), items: [],
-            paragraphBreakBefore: line.paragraphBreakBefore,
-          })).filter((line) => !!line.text);
+          let diagnostics: ExtractionControlDiagnostics = {
+            replacements: 0,
+            preexistingReplacementCharacters: 0,
+          };
+          layout.lines = result.lines.map((line) => {
+            const sanitized = replaceDisallowedControls(line.text);
+            diagnostics = mergeControlDiagnostics(diagnostics, sanitized.diagnostics);
+            return {
+              text: cleanInlineText(sanitized.text), page: pageNumber,
+              x0: line.bbox.x0 * scaleX, x1: line.bbox.x1 * scaleX,
+              top: line.bbox.y0 * scaleY, bottom: line.bbox.y1 * scaleY,
+              size: Math.max(1, line.fontSize * scaleY), items: [],
+              paragraphBreakBefore: line.paragraphBreakBefore,
+            };
+          }).filter((line) => !!line.text);
+          layout.controlDiagnostics = diagnostics;
           layout.ocr = true;
           ocrPages += 1;
         }
@@ -1115,10 +1144,12 @@ async function pdfBlocks(
           const page = await pdf.getPage(pageNumber);
           const image = await renderPdfPage(page);
           page.cleanup?.();
-          const text = await remoteOcr({ page: pageNumber, image, mimeType: 'image/png' }, signal);
-          if (text.trim()) {
+          const rawText = await remoteOcr({ page: pageNumber, image, mimeType: 'image/png' }, signal);
+          const sanitized = replaceDisallowedControls(rawText);
+          if (sanitized.text.trim()) {
             const layout = layouts[pageNumber - 1];
-            layout.lines = plainTextBlocks(text, pageNumber).map((block, line) => ({ text: block.text, page: pageNumber, x0: 0, x1: layout.width, top: line * 12, bottom: line * 12 + 10, size: 10, items: [], paragraphBreakBefore: true }));
+            layout.lines = plainTextBlocks(sanitized.text, pageNumber).map((block, line) => ({ text: block.text, page: pageNumber, x0: 0, x1: layout.width, top: line * 12, bottom: line * 12 + 10, size: 10, items: [], paragraphBreakBefore: true }));
+            layout.controlDiagnostics = sanitized.diagnostics;
             layout.ocr = true;
             ocrPages += 1;
           }
@@ -1170,18 +1201,36 @@ async function pdfBlocks(
         blocks.push(...unique.values());
       }
     }
+    const controlPages = layouts.filter((layout) =>
+      layout.controlDiagnostics.replacements > 0
+      || layout.controlDiagnostics.preexistingReplacementCharacters > 0
+    );
+    const controlDiagnostics = {
+      replacements: controlPages.reduce((sum, layout) => sum + layout.controlDiagnostics.replacements, 0),
+      preexistingReplacementCharacters: controlPages.reduce(
+        (sum, layout) => sum + layout.controlDiagnostics.preexistingReplacementCharacters, 0,
+      ),
+      pages: controlPages.map((layout) => layout.page),
+    };
     return {
       blocks,
       pages: layouts.map((layout) => ({ page: layout.page, width: rounded(layout.width), height: rounded(layout.height) })),
       ocrPages,
       blankPages: blank.length - ocrPages,
+      controlDiagnostics,
     };
   } finally {
     await pdf.destroy?.();
   }
 }
 
-function qualityReport(markdown: string, blocks: OutputBlock[], ocrPages: number, blankPages: number): LibraryQualityReport {
+function qualityReport(
+  markdown: string,
+  blocks: OutputBlock[],
+  ocrPages: number,
+  blankPages: number,
+  controls: ExtractionControlDiagnostics & { pages: number[] },
+): LibraryQualityReport {
   const prose = markdown.replace(/https?:\/\/\S+/g, 'URL');
   const warnings: string[] = [];
   const doubleSpaces = (prose.match(/(?<!\n) {2,}/g) ?? []).length;
@@ -1201,6 +1250,10 @@ function qualityReport(markdown: string, blocks: OutputBlock[], ocrPages: number
   if (brokenWordLineWraps) warnings.push('Quedan palabras partidas al final de línea.');
   if (unresolvedFootnotes.length) warnings.push(`Hay ${unresolvedFootnotes.length} nota(s) sin referencia bidireccional.`);
   if (markdown.trim().length < 100) warnings.push('La extracción contiene muy poco texto.');
+  if (controls.replacements) warnings.push(`${controls.replacements} carácter(es) de control se conservaron como �.`);
+  if (controls.preexistingReplacementCharacters) warnings.push(
+    `${controls.preexistingReplacementCharacters} carácter(es) � ya existían en la fuente.`,
+  );
   const status = warnings.length === 0 ? 'passed' : markdown.trim().length >= 100 ? 'needs-review' : 'failed';
   return {
     status, characters: markdown.length, words: (markdown.match(/[\p{L}\p{N}]+/gu) ?? []).length,
@@ -1208,7 +1261,11 @@ function qualityReport(markdown: string, blocks: OutputBlock[], ocrPages: number
     figures: blocks.filter((block) => block.kind === 'figure').length,
     tables: blocks.filter((block) => block.kind === 'table').length,
     ocrPages, blankPages, doubleSpaces, decomposedUnicodeMarks, softHyphens, brokenWordLineWraps,
-    footnoteReferences: footnoteReferences.length, footnoteDefinitions: footnoteDefinitions.length,
+    controlCharactersReplaced: controls.replacements,
+    preexistingReplacementCharacters: controls.preexistingReplacementCharacters,
+    controlReplacementPages: controls.pages,
+    footnoteReferences: footnoteReferences.length,
+    footnoteDefinitions: footnoteDefinitions.length,
     unresolvedFootnotes: unresolvedFootnotes.length, warnings,
   };
 }
@@ -1246,7 +1303,10 @@ export async function extractLibraryItem(options: {
     onProgress?.({ phase: 'analyze', progress: 0.02, message: `Analizando ${path.basename(source)}…` });
     const extracted = sourceExtension(source) === '.pdf'
       ? await pdfBlocks(source, staging, settings, onProgress, signal, options.remoteOcr)
-      : { ...(await nonPdfBlocks(source, staging)), ocrPages: 0, blankPages: 0 };
+      : {
+        ...(await nonPdfBlocks(source, staging)), ocrPages: 0, blankPages: 0,
+        controlDiagnostics: { replacements: 0, preexistingReplacementCharacters: 0, pages: [] },
+      };
     abortIfNeeded(signal);
     const blocks = extracted.blocks.filter((block) => block.markdown.trim());
     if (!blocks.length) throw new Error('No se pudo recuperar texto ni contenido legible del original.');
@@ -1267,7 +1327,9 @@ export async function extractLibraryItem(options: {
       cursor += chunk.length;
     }
     const markdown = normalizeCleanMarkdown(rendered.join(''));
-    const quality = qualityReport(markdown, blocks, extracted.ocrPages, extracted.blankPages);
+    const quality = qualityReport(
+      markdown, blocks, extracted.ocrPages, extracted.blankPages, extracted.controlDiagnostics,
+    );
     const readableBefore = store.readMaterializedItem(options.item.storageId) ?? options.item;
     if (quality.status === 'failed' && readableBefore.files?.reader) {
       throw new Error(quality.warnings.join(' ') || 'La extracción no produjo una copia legible.');

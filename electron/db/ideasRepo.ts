@@ -230,6 +230,12 @@ export function getIdea(globalId: string): Idea | null {
     embedding: row.embedding ? decodeEmbedding(row.embedding) : null,
   };
 }
+export function isIdeaActive(globalId: string): boolean {
+  return Boolean(getDb().prepare(
+    'SELECT 1 FROM ideas WHERE global_id=? AND orphaned_at IS NULL'
+  ).get(globalId));
+}
+
 
 /**
  * Lightweight idea lookup that skips the embedding BLOB. The detail panels and

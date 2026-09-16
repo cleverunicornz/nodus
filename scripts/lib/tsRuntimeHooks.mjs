@@ -112,9 +112,10 @@ export function installRuntimeHooks(userDataPath, overrides = {}) {
 export function requireElectronRuntime(scriptPath, flag) {
   if (process.argv.includes(flag)) return true;
   const { execFileSync } = require('node:child_process');
+  const forwarded = process.argv.slice(2).filter((value) => value !== flag);
   execFileSync(
     path.join(repoRoot, 'node_modules/.bin/electron'),
-    [scriptPath, flag],
+    [scriptPath, flag, ...forwarded],
     { cwd: repoRoot, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: 'inherit' }
   );
   return false;

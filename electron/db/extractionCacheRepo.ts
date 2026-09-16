@@ -1,8 +1,8 @@
 import { getDb } from './database';
 import { planExtractionCacheEviction } from '@shared/extractionCachePrune';
-import type { PdfAnalysis, SourceType } from '@shared/types';
+import type { ExtractionControlDiagnostics, PdfAnalysis, SourceType } from '@shared/types';
 
-export const EXTRACTION_CACHE_VERSION = 3;
+export const EXTRACTION_CACHE_VERSION = 4;
 
 /** How much extracted text the cache may hold before the oldest entries go. */
 const MAX_CACHE_BYTES = 64 * 1024 * 1024;
@@ -27,6 +27,7 @@ export interface ExtractionCacheDoc {
   sourceType: SourceType;
   notes: string | null;
   analysis?: PdfAnalysis;
+  controlDiagnostics?: ExtractionControlDiagnostics;
 }
 
 interface CacheKey {
@@ -75,11 +76,13 @@ export function getExtractionCache(key: CacheKey): ExtractionCacheDoc | null {
     ) as ExtractionCacheRow | undefined;
 
   if (!row) return null;
+  const cached = parseCachedAnalysis(row.analysis_json);
   return {
     text: row.text,
     sourceType: row.source_type,
     notes: row.notes,
-    analysis: parseAnalysis(row.analysis_json),
+    analysis: cached.analysis,
+    controlDiagnostics: cached.controlDiagnostics,
   };
 }
 
@@ -116,7 +119,9 @@ export function upsertExtractionCache(key: CacheKey, doc: ExtractionCacheDoc): v
       doc.sourceType,
       doc.text,
       doc.notes,
-      doc.analysis ? JSON.stringify(doc.analysis) : null,
+      doc.analysis || doc.controlDiagnostics
+        ? JSON.stringify({ pdf: doc.analysis ?? null, controls: doc.controlDiagnostics ?? null })
+        : null,
       now,
       now
     );
@@ -130,7 +135,7 @@ export function upsertExtractionCache(key: CacheKey, doc: ExtractionCacheDoc): v
 export function pruneExtractionCache(maxBytes = MAX_CACHE_BYTES): { removed: number; freedBytes: number } {
   const db = getDb();
   const rows = db
-    .prepare(`SELECT file_path, length(text) AS bytes, updated_at FROM extraction_cache`)
+    .prepare(`SELECT file_path, length(CAST(text AS BLOB)) AS bytes, updated_at FROM extraction_cache`)
     .all() as { file_path: string; bytes: number | null; updated_at: string }[];
   const plan = planExtractionCacheEviction(
     rows.map((row) => ({ filePath: row.file_path, bytes: row.bytes ?? 0, updatedAt: row.updated_at })),
@@ -155,11 +160,26 @@ function maybePruneExtractionCache(): void {
   }
 }
 
-function parseAnalysis(value: string | null): PdfAnalysis | undefined {
-  if (!value) return undefined;
+function parseCachedAnalysis(value: string | null): {
+  analysis?: PdfAnalysis;
+  controlDiagnostics?: ExtractionControlDiagnostics;
+} {
+  if (!value) return {};
   try {
-    return JSON.parse(value) as PdfAnalysis;
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    // v3 stored PdfAnalysis directly. Keep this reader tolerant for recovery
+    // archives even though v4 cache lookup will not select those rows.
+    if (typeof parsed.pageCount === 'number') {
+      const analysis = parsed as unknown as PdfAnalysis;
+      return { analysis, controlDiagnostics: analysis.controlDiagnostics };
+    }
+    return {
+      analysis: parsed.pdf && typeof parsed.pdf === 'object' ? parsed.pdf as PdfAnalysis : undefined,
+      controlDiagnostics: parsed.controls && typeof parsed.controls === 'object'
+        ? parsed.controls as ExtractionControlDiagnostics
+        : undefined,
+    };
   } catch {
-    return undefined;
+    return {};
   }
 }

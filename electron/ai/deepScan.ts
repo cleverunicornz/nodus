@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { completeJson, embedMany, AiError } from './aiClient';
 import { modelRefSupportsExtraction } from '@shared/localAiModels';
 import { deepScanPrompt } from './prompts';
-import { applyFusionPlan, resolveIdeaFusion, ExtractedIdea, FusionDecision, FusionPlan } from './fusion';
+import { applyFusionPlan, applyFusionPlanEdge, resolveIdeaFusion, ExtractedIdea, FusionDecision, FusionPlan } from './fusion';
 import {
   upsertOccurrence,
   addEvidence,
@@ -806,7 +806,7 @@ export async function runDeepScan(
           unionWorkThemes(work.nodus_id, deepThemeLabels, 4);
           for (let i = 0; i < preparedIdeas.length; i++) {
             const { labelKey, idea, ideaThemeLabels } = preparedIdeas[i];
-            const globalId = applyFusionPlan(resolvedPlans[i], work.nodus_id);
+            const globalId = applyFusionPlan(resolvedPlans[i], work.nodus_id, true);
             labelToGlobal.set(labelKey, globalId);
             setIdeaThemeLinks(work.nodus_id, globalId, ideaThemeLabels, idea.confidence, 'explicit');
             upsertOccurrence(globalId, work.nodus_id, idea.role, idea.development, idea.confidence);
@@ -814,6 +814,15 @@ export async function runDeepScan(
               addEvidence(globalId, work.nodus_id, ev.quote, ev.location, ev.kind, { sourceRef: ev.source_ref, pageNumber: ev.page_number });
             }
           }
+          // Fusion plans were made against the pre-refresh graph. Only materialize
+          // their relation after every surviving occurrence has been revived; a
+          // target owned solely by the replaced result remains dormant and must not
+          // become an exact edge endpoint.
+          for (let i = 0; i < preparedIdeas.length; i++) {
+            const from = labelToGlobal.get(preparedIdeas[i].labelKey);
+            if (from) applyFusionPlanEdge(resolvedPlans[i], from, work.nodus_id);
+          }
+
 
           for (const rel of merged.internal) {
             const from = labelToGlobal.get(rel.from);

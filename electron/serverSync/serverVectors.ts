@@ -46,6 +46,12 @@ export interface VectorSetSummary {
  * embedding its matrix is really built from. The largest coherent group wins, and only that
  * group is published — mixing two models in one matrix would return confident nonsense.
  */
+function currentProfileVectorPredicate(table: string): string {
+  return table === 'document_vectors'
+    ? ' AND EXISTS (SELECT 1 FROM document_profile_state state WHERE state.nodus_id=document_vectors.nodus_id AND state.current_version_id=document_vectors.version_id)'
+    : '';
+}
+
 function dominantEmbedding(db: Database.Database, table: string): { provider: string; model: string; dim: number; count: number } | null {
   try {
     const rows = db
@@ -53,6 +59,7 @@ function dominantEmbedding(db: Database.Database, table: string): { provider: st
         `SELECT embedding_provider AS provider, embedding_model AS model, embedding_dim AS dim, COUNT(*) AS count
            FROM "${table}"
           WHERE embedding IS NOT NULL AND embedding_provider IS NOT NULL AND embedding_model IS NOT NULL AND embedding_dim > 0
+          ${currentProfileVectorPredicate(table)}
           GROUP BY provider, model, dim
           ORDER BY count DESC
           LIMIT 1`
@@ -89,6 +96,7 @@ export function buildVectorSet(db: Database.Database, kind: VectorKind): { buffe
     .prepare(
       `SELECT "${source.id}" AS id, embedding FROM "${source.table}"
         WHERE embedding IS NOT NULL AND embedding_provider = ? AND embedding_model = ? AND embedding_dim = ?
+        ${currentProfileVectorPredicate(source.table)}
         ORDER BY "${source.id}"`
     )
     .iterate(provider, model, dim) as Iterable<{ id: string; embedding: Buffer }>;

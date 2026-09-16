@@ -6,6 +6,7 @@ import {
   allIdeaCandidates,
   addEdge,
   getIdea,
+  isIdeaActive,
   embeddingTextForIdea,
   currentEmbeddingConfig,
 } from '../db/ideasRepo';
@@ -326,8 +327,30 @@ function buildFusionPlan(
   };
 }
 
+/** Apply one planned relation after every occurrence in a refresh has been revived. */
+export function applyFusionPlanEdge(plan: FusionPlan, fromId: string, sourceWork: string): void {
+  if (!plan.edge || !isIdeaActive(plan.edge.to)) return;
+  const config = plan.embedding ? currentEmbeddingConfig() : { provider: null, model: null };
+  addEdge({
+    from_id: fromId,
+    to_id: plan.edge.to,
+    type: plan.edge.type,
+    basis: plan.edge.basis,
+    confidence: plan.edge.confidence,
+    source_work: sourceWork,
+    trace: {
+      method: 'fusion',
+      model: plan.model,
+      embeddingProvider: config.provider,
+      embeddingModel: config.model,
+      similarity: plan.edge.similarity,
+      rationale: plan.edge.rationale,
+    },
+  });
+}
+
 /** Apply a previously planned decision. Callers may compose this inside a transaction. */
-export function applyFusionPlan(plan: FusionPlan, sourceWork: string): string {
+export function applyFusionPlan(plan: FusionPlan, sourceWork: string, deferEdge = false): string {
   if (plan.existingId && getIdea(plan.existingId)) return plan.existingId;
   const created = createIdea({
     type: plan.idea.type,
@@ -337,24 +360,6 @@ export function applyFusionPlan(plan: FusionPlan, sourceWork: string): string {
     embeddingText: plan.embeddingText,
     themes: plan.themes,
   });
-  if (plan.edge && getIdea(plan.edge.to)) {
-    const config = plan.embedding ? currentEmbeddingConfig() : { provider: null, model: null };
-    addEdge({
-      from_id: created.global_id,
-      to_id: plan.edge.to,
-      type: plan.edge.type,
-      basis: plan.edge.basis,
-      confidence: plan.edge.confidence,
-      source_work: sourceWork,
-      trace: {
-        method: 'fusion',
-        model: plan.model,
-        embeddingProvider: config.provider,
-        embeddingModel: config.model,
-        similarity: plan.edge.similarity,
-        rationale: plan.edge.rationale,
-      },
-    });
-  }
+  if (!deferEdge) applyFusionPlanEdge(plan, created.global_id, sourceWork);
   return created.global_id;
 }

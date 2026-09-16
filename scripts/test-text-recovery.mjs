@@ -34,7 +34,22 @@ try {
     probeWorkTextAvailability,
   } = require(path.join(repoRoot, 'electron/extraction/textExtractor.ts'));
   const { pageText } = require(path.join(repoRoot, 'electron/extraction/pdfjsLoader.ts'));
-  const { cleanExtractedText } = require(path.join(repoRoot, 'electron/extraction/textCleanup.ts'));
+  const {
+    cleanExtractedText,
+    cleanExtractedTextWithDiagnostics,
+    replaceDisallowedControls,
+  } = require(path.join(repoRoot, 'electron/extraction/textCleanup.ts'));
+  const {
+    findLiteralSourceSpans,
+    intactSourceExcerpt,
+    selectLiteralPassageIndex,
+    textCanonicallyContainsLiteral,
+  } = require(path.join(repoRoot, 'electron/extraction/sourceTextRanges.ts'));
+  const { getDb } = require(path.join(repoRoot, 'electron/db/database.ts'));
+  const {
+    EXTRACTION_CACHE_VERSION,
+    pruneExtractionCache,
+  } = require(path.join(repoRoot, 'electron/db/extractionCacheRepo.ts'));
   const { shouldQueueDeepAfterSync } = require(path.join(repoRoot, 'electron/sync/syncService.ts'));
 
   const epubPath = path.join(root, 'sample.epub');
@@ -89,6 +104,24 @@ try {
   // invoked, so the file content is irrelevant here).
   const imgPath = path.join(root, 'record.png');
   fs.writeFileSync(imgPath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  const controlPath = path.join(root, 'controls.txt');
+  fs.writeFileSync(controlPath, 'before\u0000after\u0001end');
+  const controlDoc = await extractFromPath(controlPath);
+  assert.equal(controlDoc.text, 'before\uFFFDafter\uFFFDend');
+  assert.deepEqual(controlDoc.controlDiagnostics, { replacements: 2, preexistingReplacementCharacters: 0 });
+  const cachedControl = getDb().prepare(
+    'SELECT cache_version,text,analysis_json,length(text) chars,length(CAST(text AS BLOB)) bytes FROM extraction_cache WHERE file_path=?'
+  ).get(controlPath);
+  assert.equal(cachedControl.cache_version, EXTRACTION_CACHE_VERSION);
+  assert.ok(cachedControl.bytes > cachedControl.chars, 'cache accounting uses UTF-8 bytes for replacement glyphs');
+  assert.equal(JSON.parse(cachedControl.analysis_json).controls.replacements, 2,
+    'control diagnostics persist in the extraction cache envelope');
+  const cachedAgain = await extractFromPath(controlPath);
+  assert.deepEqual(cachedAgain.controlDiagnostics, controlDoc.controlDiagnostics, 'cache hits preserve control diagnostics');
+  const cachedBytes = getDb().prepare(
+    'SELECT COALESCE(SUM(length(CAST(text AS BLOB))),0) bytes FROM extraction_cache'
+  ).get().bytes;
+  assert.equal(pruneExtractionCache(0).freedBytes, cachedBytes, 'cache eviction reports UTF-8 payload bytes');
   const imgDoc = await extractFromPath(imgPath, { ocr: { enabled: false, languages: 'spa+eng', maxPages: 0 } });
   assert.equal(imgDoc.text, '');
   assert.equal(imgDoc.sourceType, 'upload');
@@ -100,6 +133,15 @@ try {
     'El turismo creció. La línea siguiente continúa.\n\nNuevo párrafo.',
     'shared cleanup dehyphenates line wraps without collapsing paragraph boundaries',
   );
+  const controls = replaceDisallowedControls('A\u0000B\u0001C\uFFFD');
+  assert.equal(controls.text, 'A\uFFFDB\uFFFDC\uFFFD');
+  assert.equal(controls.text.length, 'A\u0000B\u0001C\uFFFD'.length, 'one replacement preserves UTF-16 length');
+  assert.deepEqual(controls.diagnostics, { replacements: 2, preexistingReplacementCharacters: 1 });
+  const cleanedControls = cleanExtractedTextWithDiagnostics('Uno\u0000dos\n\nTres');
+  assert.equal(cleanedControls.text, 'Uno\uFFFDdos\n\nTres');
+  assert.equal(cleanedControls.diagnostics.replacements, 1);
+  assert.equal(cleanExtractedText('[[p. 12]]\nTexto\u0001 íntegro.'), '[[p. 12]] Texto\uFFFD íntegro.',
+    'cleanup preserves generated page marker text while exposing the damaged glyph');
 
   // Cleanup repairs what the line structure PROVES was split, and guesses at nothing
   // else. Rules that glued an isolated accented vowel or a standalone `fi` to their
@@ -126,6 +168,14 @@ try {
     { str: 'Nueva línea.', transform: [1, 0, 0, 10, 10, 76], width: 50, height: 10, hasEOL: true },
   ] }) });
   assert.equal(reconstructed, 'turismo español\nNueva línea.');
+  let reconstructedControls = null;
+  const reconstructedUnknown = await pageText({ getTextContent: async () => ({ items: [
+    { str: 'antes\u000B', transform: [1, 0, 0, 10, 10, 100], width: 25, height: 10, hasEOL: false },
+    { str: 'después', transform: [1, 0, 0, 10, 50, 100], width: 35, height: 10, hasEOL: true },
+  ] }) }, { onControlDiagnostics: (value) => { reconstructedControls = value; } });
+  assert.equal(reconstructedUnknown, 'antes\uFFFD después');
+  assert.equal(reconstructedControls.replacements, 1,
+    'controls are captured before item trimming can erase a boundary glyph');
 
   // Deep and retrieval chunks may never cross attachment boundaries, and every
   // continuation starts with the source/page marker needed for a valid citation.
@@ -138,6 +188,77 @@ try {
   const retrieval = planRetrievalChunks(marked, { chunkWords: 280, sourceMap: { s1: 'zotero:one', s2: 'zotero:two' } });
   assert.ok(retrieval.every((chunk) => chunk.sourceRef === 'zotero:one' || chunk.sourceRef === 'zotero:two'));
   assert.ok(retrieval.every((chunk) => chunk.pageNumber === 1));
+  assert.ok(retrieval.every((chunk) => chunk.charStart < chunk.charEnd));
+  assert.ok(retrieval.every((chunk) => marked.slice(chunk.charStart, chunk.charEnd).includes(chunk.text.split(' ')[0])));
+
+  const canonicalSource = 'Préface. Cafe\u0301\u00a0méthode [[p. 2]] avec résultat.';
+  const canonicalQuote = 'Café méthode avec résultat.';
+  const canonicalMatches = findLiteralSourceSpans(canonicalSource, canonicalQuote);
+  assert.equal(canonicalMatches.length, 1, 'NFC, layout whitespace, and page markers preserve one literal occurrence');
+  assert.equal(canonicalSource.slice(canonicalMatches[0].charStart, canonicalMatches[0].charEnd), 'Cafe\u0301\u00a0méthode [[p. 2]] avec résultat.');
+  assert.equal(textCanonicallyContainsLiteral('alpha\u0000beta', 'alpha beta'), false,
+    'a damaged control glyph is a barrier, not whitespace that manufactures a match');
+  assert.equal(findLiteralSourceSpans('alpha\u0000target evidence', 'target evidence')[0].charStart, 6,
+    'matching after an embedded control uses the full JavaScript string');
+  assert.equal(textCanonicallyContainsLiteral('alpha\uFFFDbeta', 'alpha beta'), false);
+  assert.equal(textCanonicallyContainsLiteral('alpha\uFFFDbeta', 'alpha\uFFFDbeta'), false,
+    'the visible replacement is not certifiable literal evidence');
+  assert.equal(findLiteralSourceSpans('alpha\uFFFDtarget evidence', 'target evidence')[0].charStart, 6);
+  assert.equal(intactSourceExcerpt('damaged\uFFFDthe longest intact evidence segment', 900),
+    'the longest intact evidence segment');
+  const astralSource = '😀 prefix target evidence';
+  const astral = findLiteralSourceSpans(astralSource, 'target evidence')[0];
+  assert.equal(astralSource.slice(astral.charStart, astral.charEnd), 'target evidence',
+    'raw UTF-16 ranges remain correct after an astral character');
+
+  const selectedSource = 'early related wording. The complete quoted finding appears here.';
+  const selectedQuote = 'The complete quoted finding appears here.';
+  const selectedSpan = findLiteralSourceSpans(selectedSource, selectedQuote)[0];
+  const selected = selectLiteralPassageIndex([
+    {
+      text: 'early related wording complete quoted finding appears',
+      charStart: 0, charEnd: 22, sourceRef: 'source-a', pageNumber: 7, chunkIndex: 0,
+    },
+    {
+      text: selectedQuote,
+      charStart: selectedSpan.charStart, charEnd: selectedSpan.charEnd,
+      sourceRef: 'source-a', pageNumber: 17, chunkIndex: 1,
+    },
+  ], selectedQuote, selectedSpan, 'source-a', 17);
+  assert.equal(selected, 1, 'a complete same-occurrence passage beats an earlier keyword-equivalent passage');
+
+  const overlapSource = 'prefix '.repeat(20) + 'Quoted evidence crosses the page boundary.';
+  const overlapQuote = 'Quoted evidence crosses the page boundary.';
+  const overlapSpan = findLiteralSourceSpans(overlapSource, overlapQuote)[0];
+  assert.equal(selectLiteralPassageIndex([
+    {
+      text: overlapQuote, charStart: 0, charEnd: overlapSource.length,
+      sourceRef: 'source-a', pageNumber: 1, chunkIndex: 4,
+    },
+    {
+      text: overlapQuote, charStart: overlapSpan.charStart, charEnd: overlapSpan.charEnd,
+      sourceRef: 'source-a', pageNumber: 2, chunkIndex: 5,
+    },
+  ], overlapQuote, overlapSpan, 'source-a', 2), 1,
+  'overlapping containing passages prefer the one beginning on the support page');
+  assert.equal(selectLiteralPassageIndex([
+    {
+      text: 'Quoted evidence crosses', charStart: overlapSpan.charStart, charEnd: overlapSpan.charStart + 24,
+      sourceRef: 'source-a', pageNumber: 2, chunkIndex: 5,
+    },
+    {
+      text: 'the page boundary.', charStart: overlapSpan.charStart + 16, charEnd: overlapSpan.charEnd,
+      sourceRef: 'source-a', pageNumber: 2, chunkIndex: 6,
+    },
+  ], overlapQuote, overlapSpan, 'source-a', 2), null,
+  'a quotation split across passages has no exact passage edge');
+  assert.equal(selectLiteralPassageIndex([
+    {
+      text: overlapQuote, charStart: overlapSpan.charStart, charEnd: overlapSpan.charEnd,
+      sourceRef: 'source-b', pageNumber: 2, chunkIndex: 5,
+    },
+  ], overlapQuote, overlapSpan, 'source-a', 2), null,
+  'an identical quotation in another source cannot steal the evidence edge');
 
   const resolved = resolvedTextStateFromDoc({
     text: '[[src:s1 p.1]] texto utilizable '.repeat(20), sourceType: 'pdf', notes: null,

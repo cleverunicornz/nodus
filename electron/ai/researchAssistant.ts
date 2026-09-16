@@ -1303,6 +1303,8 @@ function compactDocumentOrientation(hits: HierarchicalDocumentHit[]): unknown[] 
     orientation: clipText(hit.text, 2_000).text,
     explanation: hit.explanation,
     orientation_only: true,
+    profile_semantic_approved: hit.semanticPassed,
+    profile_fallback: hit.profileFallback,
     citable: false,
   }));
 }

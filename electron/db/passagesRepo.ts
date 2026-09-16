@@ -106,6 +106,9 @@ export function replaceWorkPassages(nodusId: string, contentHash: string, rows: 
      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   db.transaction(() => {
+    // Passage ids are stable chunk slots, not content identities. A replacement
+    // must detach exact-support edges before those ids can name different text.
+    db.prepare('UPDATE document_profile_support SET passage_id=NULL WHERE nodus_id=?').run(nodusId);
     db.prepare('DELETE FROM passages WHERE nodus_id = ?').run(nodusId);
     rows.forEach((row, chunkIndex) => {
       const embedding = row.embedding;
@@ -361,5 +364,9 @@ export function workPassageStatuses(nodusIds?: string[]): WorkPassageStatus[] {
 }
 
 export function clearAllPassages(): void {
-  getDb().prepare('DELETE FROM passages').run();
+  const db = getDb();
+  db.transaction(() => {
+    db.prepare('UPDATE document_profile_support SET passage_id=NULL WHERE passage_id IS NOT NULL').run();
+    db.prepare('DELETE FROM passages').run();
+  })();
 }

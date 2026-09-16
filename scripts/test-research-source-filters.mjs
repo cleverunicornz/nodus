@@ -30,7 +30,9 @@ try {
     passages.replaceWorkPassages(id, 'hash', [{ text, pageLabel: '1', embedding: outside ? [1, 0] : [.8, .6] }]);
     profiles.publishDocumentProfile({ nodusId: id, sourceFingerprint: 'hash', pipelineVersion: 'test/1', schemaVersion: 1, sourceLanguage: 'es', presentationLanguage: 'es', profile: { overview: text }, overview: text, sections: [], fields: [], supports: [], ideaLinks: [],
       vectors: [{ vectorId: `v-${id}`, kind: 'overview', sourceId: `s-${id}`, text, weight: 1, embedding: outside ? [1, 0] : [.8, .6] }],
-      generatorModel: null, auditorModel: null, promptHash: 'test', audit: { passed: true, score: 1, issues: [] }, qualityScore: 1 });
+      generatorModel: null, auditorModel: null, promptHash: 'test',
+      audit: { passed: true, score: 1, supportCoverage: 1, structureCoverage: 1, issues: [], repaired: false },
+      qualityScore: 1 });
     summaries.upsertWorkSummary({ nodusId: id, summary: text, sourceLevel: 'deep', contentHash: 'hash', model: null });
     summaries.updateWorkSummaryEmbedding(id, text, outside ? [1, 0] : [.8, .6]);
   }

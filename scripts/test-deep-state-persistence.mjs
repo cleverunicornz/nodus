@@ -23,6 +23,7 @@ try {
   const database = require(path.join(repoRoot, 'electron/db/database.ts'));
   const works = require(path.join(repoRoot, 'electron/db/worksRepo.ts'));
   const ideas = require(path.join(repoRoot, 'electron/db/ideasRepo.ts'));
+  const fusion = require(path.join(repoRoot, 'electron/ai/fusion.ts'));
   const passages = require(path.join(repoRoot, 'electron/db/passagesRepo.ts'));
   closeDb = database.closeDb;
   const db = database.getDb();
@@ -78,6 +79,47 @@ try {
     throw new Error('fault after purge');
   })());
   assert.equal(db.prepare("SELECT COUNT(*) count FROM idea_occurrences WHERE nodus_id='w1'").get().count, 1, 'transaction rollback restores the previous analysis');
+  db.prepare(`INSERT INTO works (
+    nodus_id,zotero_key,title,authors_json,item_type,source_type,light_status,deep_status,summary_status,archived
+  ) VALUES ('refresh-fusion','ZRF','Refresh fusion','[]','book','pdf','done','done','none',0)`).run();
+  const dormantOnly = ideas.createIdea({
+    type: 'claim', label: 'Dormant target', statement: 'Only the replaced result owns this.', embedding: null, themes: [],
+  });
+  const revivedTarget = ideas.createIdea({
+    type: 'claim', label: 'Revived target', statement: 'The replacement extracts this again.', embedding: null, themes: [],
+  });
+  ideas.upsertOccurrence(dormantOnly.global_id, 'refresh-fusion', 'principal', 'old', 1);
+  ideas.upsertOccurrence(revivedTarget.global_id, 'refresh-fusion', 'principal', 'old', 1);
+  ideas.purgeDeepData('refresh-fusion');
+  assert.equal(ideas.isIdeaActive(dormantOnly.global_id), false);
+  assert.equal(ideas.isIdeaActive(revivedTarget.global_id), false);
+  const fusionPlan = (label, target) => ({
+    idea: { localId: label, type: 'claim', label, statement: `${label} statement` },
+    embedding: null, embeddingText: `${label} statement`, themes: [], model: null,
+    existingId: null, label,
+    edge: {
+      to: target, type: 'variant_of', basis: 'inferred', confidence: 0.8,
+      similarity: null, rationale: 'synthetic refresh regression',
+    },
+  });
+  const skippedPlan = fusionPlan('New idea with stale target', dormantOnly.global_id);
+  const keptPlan = fusionPlan('New idea with revived target', revivedTarget.global_id);
+  const skippedFrom = fusion.applyFusionPlan(skippedPlan, 'refresh-fusion', true);
+  const keptFrom = fusion.applyFusionPlan(keptPlan, 'refresh-fusion', true);
+  ideas.upsertOccurrence(skippedFrom, 'refresh-fusion', 'principal', 'new', 1);
+  ideas.upsertOccurrence(keptFrom, 'refresh-fusion', 'principal', 'new', 1);
+  ideas.upsertOccurrence(revivedTarget.global_id, 'refresh-fusion', 'secondary', 'revived', 1);
+  fusion.applyFusionPlanEdge(skippedPlan, skippedFrom, 'refresh-fusion');
+  fusion.applyFusionPlanEdge(keptPlan, keptFrom, 'refresh-fusion');
+  assert.equal(db.prepare(
+    'SELECT COUNT(*) n FROM edges WHERE source_work=? AND (from_id=? OR to_id=?)'
+  ).get('refresh-fusion', dormantOnly.global_id, dormantOnly.global_id).n, 0,
+  'a refresh never publishes a fusion edge to an idea left dormant by its own purge');
+  assert.equal(db.prepare(
+    'SELECT COUNT(*) n FROM edges WHERE source_work=? AND (from_id=? OR to_id=?)'
+  ).get('refresh-fusion', revivedTarget.global_id, revivedTarget.global_id).n, 1,
+  'deferred fusion edges publish after their target occurrence is revived');
+  assert.doesNotThrow(() => ideas.assertDeepDataIntegrity('refresh-fusion'));
 
   works.setDeepResult('w1', 'done', 'new-hash', 'epub', null);
   row = db.prepare('SELECT * FROM works WHERE nodus_id=?').get('w1');
@@ -241,7 +283,6 @@ try {
   // embedding provider configured, no key, exhausted quota. The ideas table allows a
   // null statement and a real 14,612-idea vault holds six of them, so that fallback used
   // to throw on the first one and take the whole scan down with it, for every work.
-  const fusion = require(path.join(repoRoot, 'electron/ai/fusion.ts'));
   db.prepare("INSERT INTO ideas (global_id,type,label,statement,created_at) VALUES ('g-null','claim','idea sin enunciado',NULL,?)")
     .run(new Date().toISOString());
   const plan = await fusion.planIdeaFusion(

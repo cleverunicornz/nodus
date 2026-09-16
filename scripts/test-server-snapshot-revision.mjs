@@ -55,6 +55,39 @@ test('streaming revision matches the former whole-object JSON digest', () => {
   }
 });
 
+test('server snapshots publish only the selected current document profile version', () => {
+  const db = new Database(path.join(root, 'profile-history.sqlite'));
+  try {
+    runMigrations(db);
+    db.prepare("INSERT INTO works(nodus_id,zotero_key,title) VALUES('w1','Z1','Profile history')").run();
+    const insertVersion = db.prepare(`INSERT INTO document_profile_versions(
+      version_id,nodus_id,state,source_fingerprint,pipeline_version,schema_version,presentation_language,
+      overview,profile_json,prompt_hash,created_at,published_at
+    ) VALUES(?,?,?,?,?,2,'en',?,'{}','prompt','2026-01-01','2026-01-01')`);
+    insertVersion.run('version-old','w1','superseded','source','document-profile/5','Old overview');
+    insertVersion.run('version-current','w1','current','source','document-profile/5','Current overview');
+    db.prepare(`INSERT INTO document_profile_state(
+      nodus_id,current_version_id,status,source_fingerprint,pipeline_version,updated_at
+    ) VALUES('w1','version-current','current','source','document-profile/5','2026-01-01')`).run();
+    const insertField = db.prepare(`INSERT INTO document_profile_fields(
+      field_id,version_id,nodus_id,kind,ordinal,text,confidence,centrality,created_at
+    ) VALUES(?,?,?,?,0,?,1,1,'2026-01-01')`);
+    insertField.run('field-old','version-old','w1','thesis','OLD_PROFILE_TEXT');
+    insertField.run('field-current','version-current','w1','thesis','CURRENT_PROFILE_TEXT');
+    const payload = JSON.parse(buildServerSnapshot(
+      { id: 'v1', name: 'Synthetic', type: 'academic' },
+      { nodusServerIncludeUserContent: true, nodusServerIncludePassages: false },
+      db,
+      null,
+    ).buffer.toString('utf8'));
+    assert.deepEqual(payload.tables.document_profile_versions.map((row) => row.version_id), ['version-current']);
+    assert.deepEqual(payload.tables.document_profile_fields.map((row) => row.field_id), ['field-current']);
+    assert.doesNotMatch(JSON.stringify(payload.tables), /OLD_PROFILE_TEXT/);
+  } finally {
+    db.close();
+  }
+});
+
 test('revision hashing streams values instead of materialising the full object again', () => {
   const source = fs.readFileSync(path.join(repoRoot, 'electron/serverSync/serverSnapshot.ts'), 'utf8');
   assert.match(source, /updateJsonHash\(revisionHash,/);

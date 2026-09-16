@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { LibraryAnalysisReuseComponent } from '@shared/libraryTypes';
 import type { AppSettings, ModelRef } from '@shared/types';
+import { DOCUMENT_PROFILE_PIPELINE_VERSION } from '@shared/documentProfilePolicy';
 import { getDb } from './database';
 import { getSettings } from './settingsRepo';
 
@@ -11,7 +12,7 @@ export const ANALYSIS_PIPELINES: Record<LibraryAnalysisReuseComponent, string> =
   ideas: 'nodus-deep-scan/3',
   passages: 'nodus-passage-index/2',
   embeddings: 'nodus-embeddings/2',
-  documentProfile: 'document-profile/1',
+  documentProfile: DOCUMENT_PROFILE_PIPELINE_VERSION,
 };
 
 export interface LibraryAnalysisProvenanceRecord {

@@ -1013,6 +1013,24 @@ app.whenReady().then(async () => {
   });
   removeDisplacedMacBundle();
   restorePersistedDockIcon();
+  // Paid canaries may call their approved provider from the main process, but the
+  // renderer must not wake unrelated remote embeds, catalogues, or integrations.
+  if (process.env.NODUS_CANARY_BLOCK_EXTERNAL_RENDERER_NETWORK === '1') {
+    session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
+      try {
+        const requestUrl = new URL(details.url);
+        const networkProtocol = ['http:', 'https:', 'ws:', 'wss:'].includes(requestUrl.protocol);
+        const hostname = requestUrl.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+        const loopback = hostname === 'localhost'
+          || hostname === '127.0.0.1'
+          || hostname === '::1'
+          || hostname.endsWith('.localhost');
+        callback({ cancel: networkProtocol && !loopback });
+      } catch {
+        callback({ cancel: true });
+      }
+    });
+  }
   // YouTube (embedded by the PDF Presenter's audience overlay) flags Electron's
   // User-Agent as a bot. Strip the Electron/app tokens so the embed loads; the
   // change is cosmetic for every other kind of web content Nodus may open.

@@ -2,6 +2,11 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import {
+  mergeControlDiagnostics,
+  replaceDisallowedControls,
+  type ExtractionControlDiagnostics,
+} from './textCleanup';
 
 // Single place to load the pdfjs legacy build (no DOM) and open a document.
 // pdfjs is an ESM-only package; dynamic import keeps it external to the main bundle.
@@ -34,8 +39,15 @@ export async function openPdf(filePath: string, options: { forRendering?: boolea
 
 /** Rebuild page lines before normalising them. Flattening every PDF.js item with a
  * space destroys real line endings, prevents safe de-hyphenation and can split words. */
-export async function pageText(page: any): Promise<string> {
+export async function pageText(
+  page: any,
+  options: { onControlDiagnostics?: (diagnostics: ExtractionControlDiagnostics) => void } = {},
+): Promise<string> {
   const content = await page.getTextContent();
+  let controlDiagnostics: ExtractionControlDiagnostics = {
+    replacements: 0,
+    preexistingReplacementCharacters: 0,
+  };
   const lines: string[] = [];
   let line = '';
   let lastY: number | null = null;
@@ -48,7 +60,10 @@ export async function pageText(page: any): Promise<string> {
     lastEndX = null;
   };
   for (const item of content.items as any[]) {
-    const value = typeof item?.str === 'string' ? item.str : '';
+    const rawValue = typeof item?.str === 'string' ? item.str : '';
+    const sanitized = replaceDisallowedControls(rawValue);
+    controlDiagnostics = mergeControlDiagnostics(controlDiagnostics, sanitized.diagnostics);
+    const value = sanitized.text;
     if (!value) {
       if (item?.hasEOL) flush();
       continue;
@@ -78,5 +93,6 @@ export async function pageText(page: any): Promise<string> {
       joined.push(current);
     }
   }
+  options.onControlDiagnostics?.(controlDiagnostics);
   return joined.join('\n').trim();
 }

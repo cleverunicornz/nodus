@@ -55,6 +55,8 @@ test('every failure the user listed is classified into its own code and category
     ['context overflow', aiError('El contexto se queda sin espacio', 'context_overflow', { config: true }), 'context_overflow', 'provider'],
     ['no model configured', aiError('No hay un modelo de IA configurado.', 'model_required', { config: true }), 'model_missing', 'model'],
     ['empty provider response', aiError('Respuesta vacía del proveedor', 'provider_empty_error', { retriable: true }), 'provider_empty', 'provider'],
+    ['publication contract rejected', Object.assign(new Error('candidate cannot publish'), { code: 'publish_failed' }), 'publish_failed', 'indexing'],
+    ['SQLite constraint', Object.assign(new Error('UNIQUE constraint failed'), { name: 'SqliteError', code: 'SQLITE_CONSTRAINT_PRIMARYKEY' }), 'db_error', 'storage'],
     ['dropped socket', Object.assign(new Error('Connection error.'), { name: 'APIConnectionError' }), 'connection', 'connection'],
     ['socket errno', Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }), 'connection', 'connection'],
     ['HTTP 429 without a code', Object.assign(new Error('Too many requests'), { status: 429 }), 'rate_limit', 'provider'],

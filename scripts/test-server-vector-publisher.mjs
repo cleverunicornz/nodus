@@ -113,6 +113,13 @@ test('what the desktop encodes is exactly what the server decodes', { timeout: 1
       version_id,nodus_id,state,source_fingerprint,pipeline_version,schema_version,presentation_language,
       overview,profile_json,prompt_hash,created_at,published_at
     ) VALUES('profile-doc','w-doc','current','source','document-profile/1',1,'en','Overview','{}','prompt','2026-01-01','2026-01-01')`).run();
+    db.prepare(`INSERT INTO document_profile_state(
+      nodus_id,current_version_id,status,source_fingerprint,pipeline_version,updated_at
+    ) VALUES('w-doc','profile-doc','current','source','document-profile/1','2026-01-01')`).run();
+    db.prepare(`INSERT INTO document_profile_versions(
+      version_id,nodus_id,state,source_fingerprint,pipeline_version,schema_version,presentation_language,
+      overview,profile_json,prompt_hash,created_at,published_at
+    ) VALUES('profile-old','w-doc','superseded','source','document-profile/1',1,'en','Old','{}','prompt','2025-01-01','2025-01-01')`).run();
     const documentVector = pseudoVector(777, dim);
     db.prepare(`INSERT INTO document_vectors(
       vector_id,nodus_id,version_id,kind,source_id,text,text_hash,weight,embedding,
@@ -120,6 +127,13 @@ test('what the desktop encodes is exactly what the server decodes', { timeout: 1
     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       'doc-vector','w-doc','profile-doc','overview',null,'Overview','hash',1,encode(documentVector),
       'openrouter','baai/bge-m3',dim,'2026-01-01',
+    );
+    db.prepare(`INSERT INTO document_vectors(
+      vector_id,nodus_id,version_id,kind,source_id,text,text_hash,weight,embedding,
+      embedding_provider,embedding_model,embedding_dim,created_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      'doc-vector-old','w-doc','profile-old','overview',null,'Old','old-hash',1,encode(documentVector),
+      'openrouter','baai/bge-m3',dim,'2025-01-01',
     );
     const documentSet = buildVectorSet(db, 'documents');
     assert.equal(documentSet.summary.count, 1);

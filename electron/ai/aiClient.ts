@@ -78,6 +78,7 @@ import {
   type LocalRequestPlan,
 } from './localRequestPlanner';
 import { completeLocalNative, LocalNativeUnavailableError, streamLocalNative } from './localNativeCompletion';
+import { PaidOperationApprovalError, reservePaidOperationRequest } from './paidOperationApproval';
 
 const concurrencyListeners = new Set<(snapshots: AiConcurrencySnapshot[]) => void>();
 const concurrencyTelemetry = new Map<string, string>();
@@ -190,7 +191,14 @@ function scheduleProviderRequest<T>(
 ): Promise<T> {
   const queuedAt = process.hrtime.bigint();
   const requestHash = providerRequestHash(model, opts);
-  return aiRequestScheduler.run(providerRequestDescriptor(model, opts, key, endpoint), async () => {
+  const descriptor = providerRequestDescriptor(model, opts, key, endpoint);
+  try {
+    reservePaidOperationRequest(descriptor);
+  } catch (error) {
+    if (error instanceof PaidOperationApprovalError) throw new AiError(error.message, false, true, 'auth');
+    throw error;
+  }
+  return aiRequestScheduler.run(descriptor, async () => {
     const startedAt = process.hrtime.bigint();
     const meta = {
       provider: model.provider,
@@ -1343,6 +1351,7 @@ async function rawCompleteTransport(
       outputTokens: Number((res as any).usage?.completion_tokens) || null,
     });
     const content = choice?.message?.content ?? '';
+    const finishReason = String(choice?.finish_reason ?? '');
     // A structured response cut off at the output ceiling is not partial data, it is
     // broken data: extractJson's jsonrepair pass closes the dangling braces without a
     // word, so the caller silently stores a fraction of the ideas — or trips the schema
@@ -1350,7 +1359,7 @@ async function rawCompleteTransport(
     // hunting for a prompt bug that isn't there. Refuse instead. Plain prose is kept
     // as-is unless the caller opts into the same contract, because a chat answer cut
     // short is still usable while a persisted summary must not be stored clipped.
-    const cutOff = /^(length|max_tokens|max_output_tokens)$/i.test(choice?.finish_reason ?? '');
+    const cutOff = /^(length|max_tokens|max_output_tokens)$/i.test(finishReason);
     if (cutOff && (jsonMode || opts.requireCompleteOutput)) {
       throw new AiError(
         jsonMode ? truncatedJsonMessage(model, maxTokens) : truncatedOutputMessage(model, maxTokens),
@@ -1364,14 +1373,18 @@ async function rawCompleteTransport(
     // response guard so chunk-aware callers can recover by bisecting the input instead
     // of treating a recoverable truncation as a terminal provider failure.
     if (!content.trim()) {
-      if ((choice as any)?.finish_reason === 'error') {
-        // OpenRouter can surface an upstream failure as a syntactically successful
-        // HTTP response with an empty choice. Unlike an ambiguous timeout, the server
-        // has explicitly said that no completion was produced, so an exact bounded
-        // replay is safe and cannot duplicate a usable result.
+      if (finishReason === 'tool_calls') {
+        throw new AiError(
+          'El proveedor devolvió una llamada de herramienta que Nodus no solicitó; la respuesta se rechazó sin ejecutar ni interpretar sus argumentos.',
+          false,
+          false,
+          'bad_request',
+        );
+      }
+      if (finishReason === 'error') {
         throw new AiError('El backend de IA terminó la solicitud sin producir respuesta.', true, false, 'provider_empty_error');
       }
-      throw new AiError(`Respuesta vacía del proveedor de IA (${choice?.finish_reason ?? 'sin finish_reason'}).`, false);
+      throw new AiError(`Respuesta vacía del proveedor de IA (${finishReason || 'sin finish_reason'}).`, false);
     }
     return content;
   } catch (e: any) {
@@ -2084,6 +2097,12 @@ async function requestEmbeddings(
       model: modelId,
       input: Array.isArray(input) ? input : [input],
     })).digest('hex');
+    try {
+      reservePaidOperationRequest(descriptor);
+    } catch (error) {
+      if (error instanceof PaidOperationApprovalError) throw new AiError(error.message, false, true, 'auth');
+      throw error;
+    }
     return aiRequestScheduler.run(descriptor, async () => {
       const startedAt = process.hrtime.bigint();
       const meta = { provider, model: modelId, class: 'embedding', inputs: expected, jobId: options.jobId ?? null, requestHash };

@@ -566,6 +566,9 @@ export interface LibraryQualityReport {
   decomposedUnicodeMarks: number;
   softHyphens: number;
   brokenWordLineWraps: number;
+  controlCharactersReplaced: number;
+  preexistingReplacementCharacters: number;
+  controlReplacementPages: number[];
   footnoteReferences: number;
   footnoteDefinitions: number;
   unresolvedFootnotes: number;

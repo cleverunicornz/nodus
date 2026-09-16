@@ -12,6 +12,7 @@ type WorkRow = Work & {
   creators_json?: string | null;
 };
 
+
 interface AnalysisCounts {
   themes: number;
   ideas: number;
@@ -547,11 +548,29 @@ function copyDocumentProfile(
      WHERE link.version_id=@sourceVersion
   `).run({ targetId, versionId, sourceVersion });
   tableChange(db, tableRows, 'document_idea_links');
+  // Target-vault corrections win. Keep them and flag them for review against the
+  // imported generated version; copy source corrections only for paths the target
+  // has never edited.
   db.prepare(`
-    INSERT INTO document_profile_overrides(override_id,nodus_id,field_path,base_version_id,generated_value_json,value_json,
-      verified,conflict,created_at,updated_at)
-    SELECT @targetId||':override:'||override_id,@targetId,field_path,@versionId,generated_value_json,value_json,
-      verified,conflict,created_at,updated_at FROM ${SOURCE_ALIAS}.document_profile_overrides WHERE nodus_id=@sourceId
+    UPDATE document_profile_overrides
+       SET base_version_id=@versionId, conflict=1, updated_at=@updatedAt
+     WHERE nodus_id=@targetId
+  `).run({ targetId, versionId, updatedAt: new Date().toISOString() });
+  tableChange(db, tableRows, 'document_profile_overrides');
+  db.prepare(`
+    INSERT INTO document_profile_overrides(
+      override_id,nodus_id,field_path,base_version_id,generated_value_json,value_json,
+      verified,conflict,created_at,updated_at
+    )
+    SELECT @targetId||':override:'||source.override_id,@targetId,source.field_path,@versionId,
+           source.generated_value_json,source.value_json,source.verified,source.conflict,
+           source.created_at,source.updated_at
+      FROM ${SOURCE_ALIAS}.document_profile_overrides source
+     WHERE source.nodus_id=@sourceId
+       AND NOT EXISTS (
+         SELECT 1 FROM document_profile_overrides target
+          WHERE target.nodus_id=@targetId AND target.field_path=source.field_path
+       )
   `).run({ targetId, sourceId, versionId });
   tableChange(db, tableRows, 'document_profile_overrides');
   const sourceState = db.prepare(`SELECT * FROM ${SOURCE_ALIAS}.document_profile_state WHERE nodus_id=?`).get(sourceId) as Record<string, unknown>;
@@ -561,9 +580,26 @@ function copyDocumentProfile(
       sourceState.pipeline_version, null, null, sourceState.updated_at,
     );
   tableChange(db, tableRows, 'document_profile_state');
-  const title = (db.prepare('SELECT title FROM works WHERE nodus_id=?').get(targetId) as { title: string }).title;
-  const overview = (db.prepare('SELECT overview FROM document_profile_versions WHERE version_id=?').get(versionId) as { overview: string }).overview;
-  const fields = (db.prepare('SELECT text FROM document_profile_fields WHERE version_id=? ORDER BY kind,ordinal').all(versionId) as Array<{ text: string }>).map((row) => row.text).join('\n');
+  const titleRow = db.prepare('SELECT title FROM works WHERE nodus_id=?').get(targetId) as { title: string };
+  const overviewRow = db.prepare('SELECT overview FROM document_profile_versions WHERE version_id=?').get(versionId) as { overview: string };
+  const title = titleRow.title;
+  const generatedOverview = overviewRow.overview;
+  const overrides = new Map<string, string>(
+    (db.prepare('SELECT field_path,value_json FROM document_profile_overrides WHERE nodus_id=?').all(targetId) as Array<{ field_path: string; value_json: string }>)
+      .flatMap((row) => {
+        try {
+          const parsed: unknown = JSON.parse(row.value_json);
+          return typeof parsed === 'string' ? [[row.field_path, parsed] as const] : [];
+        } catch {
+          return [];
+        }
+      }),
+  );
+  const overview = overrides.get('overview') ?? generatedOverview;
+  const fields = (db.prepare('SELECT kind,ordinal,text FROM document_profile_fields WHERE version_id=? ORDER BY kind,ordinal')
+    .all(versionId) as Array<{ kind: string; ordinal: number; text: string }>)
+    .map((row) => overrides.get(`fields.${row.kind}.${row.ordinal}`) ?? row.text)
+    .join('\n');
   db.prepare('DELETE FROM document_profiles_fts WHERE nodus_id=?').run(targetId);
   db.prepare('INSERT INTO document_profiles_fts(nodus_id,version_id,title,overview,fields) VALUES(?,?,?,?,?)').run(targetId, versionId, title, overview, fields);
   db.prepare('DELETE FROM document_sections_fts WHERE nodus_id=?').run(targetId);
@@ -693,9 +729,9 @@ function importMatch(
     };
   }
 
+  targetDb.pragma('foreign_keys = ON');
   targetDb.prepare(`ATTACH DATABASE ? AS ${SOURCE_ALIAS}`).run(match.path);
   try {
-    targetDb.pragma('foreign_keys = OFF');
     const tx = targetDb.transaction(() => {
       if (options.signal?.aborted) throw new Error('LIBRARY_REUSE_CANCELED');
       clearReusableTargetRows(targetDb, target.nodus_id, imported);
@@ -705,13 +741,13 @@ function importMatch(
       if (imported.includes('summary')) copySummary(targetDb, match.work.nodus_id, target.nodus_id, tableRows);
       if (imported.includes('passages')) copyPassages(targetDb, match.work.nodus_id, target.nodus_id, tableRows, imported.includes('ideaEmbeddings'));
       if (imported.includes('documentProfile')) copyDocumentProfile(targetDb, match.work.nodus_id, target.nodus_id, tableRows);
-      // Checkpoints describe an in-flight operation, not a reusable result.
       updateWorkStatus(targetDb, match.work, target.nodus_id, imported);
       copyProvenance(targetDb, match.work.nodus_id, target.nodus_id, match.vaultId, imported, tableRows);
+      const violations = targetDb.pragma('foreign_key_check') as Array<Record<string, unknown>>;
+      if (violations.length) throw new Error(`LIBRARY_REUSE_FOREIGN_KEY_VIOLATION:${violations.length}`);
     });
     tx();
   } finally {
-    targetDb.pragma('foreign_keys = ON');
     try {
       targetDb.prepare(`DETACH DATABASE ${SOURCE_ALIAS}`).run();
     } catch {

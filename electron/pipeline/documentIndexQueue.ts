@@ -5,6 +5,7 @@ import type {
   VaultSummary,
   Work,
 } from '@shared/types';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { getDb, withVaultDatabase } from '../db/database';
 import { getSettings } from '../db/settingsRepo';
 import {
@@ -16,15 +17,22 @@ import {
   listDocumentIndexCampaigns,
   listDocumentIndexJobs,
   recoverInterruptedDocumentJobs,
+  restoreDocumentProfileStateAfterFailure,
   requeueDocumentIndexJobForSourceChange,
   setDocumentCampaignStatus,
   setDocumentProfileState,
   updateDocumentIndexJob,
 } from '../db/documentProfilesRepo';
 import { getVault, listVaults } from '../vaults/vaultRegistry';
-import { runDocumentProfileScan } from '../ai/documentProfile';
+import { DocumentSourceUnavailableError, runDocumentProfileScan } from '../ai/documentProfile';
 import { AiError } from '../ai/aiClient';
-import { logPipelineFailure, logPipelineSuccess, logPipelineWarning, withPipelineLogScope } from '../logging/pipelineLogCore';
+import {
+  classifyPipelineError,
+  logPipelineFailure,
+  logPipelineSuccess,
+  logPipelineWarning,
+  withPipelineLogScope,
+} from '../logging/pipelineLogCore';
 import { coalesce } from '../util/coalesce';
 import { registerDocumentIndexMaintenanceController } from './documentIndexMaintenance';
 import { compareDocumentIndexJobsForDisplay } from '@shared/documentIndexProgress';
@@ -298,29 +306,44 @@ class DocumentIndexQueue {
       }
     });
     this.schedule();
-    let result = await withVaultDatabase(vaultId, () => documentProfileStatuses(ids));
-    while (!result.every((state) =>
-      state.status === 'current'
-      || (options.allowUnavailable && state.status === 'unavailable')
-      || (options.allowFailed && state.status === 'failed')
-    )) {
+    const preparationSnapshot = () => {
+      const states = documentProfileStatuses(ids);
+      const wanted = new Set(ids);
+      const latestJobs = new Map<string, DocumentIndexJob>();
+      // listDocumentIndexJobs orders live work first, then terminal work by newest
+      // update. The first row per document is therefore the attempt governing this wait.
+      for (const job of listDocumentIndexJobs()) {
+        if (wanted.has(job.nodusId) && !latestJobs.has(job.nodusId)) latestJobs.set(job.nodusId, job);
+      }
+      return { states, latestJobs };
+    };
+    let result = await withVaultDatabase(vaultId, preparationSnapshot);
+    const settled = (state: typeof result.states[number]): boolean => {
+      if (state.status === 'current') return true;
+      if (options.allowUnavailable && state.status === 'unavailable') return true;
+      if (options.allowFailed && state.status === 'failed') return true;
+      return Boolean(options.allowFailed && result.latestJobs.get(state.nodusId)?.status === 'failed');
+    };
+    while (!result.states.every(settled)) {
       options.signal?.throwIfAborted();
-      const failed = result.filter((state) => state.status === 'failed');
-      const unavailable = result.filter((state) => state.status === 'unavailable');
-      const paused = result.filter((state) => state.status === 'paused');
-      // A pause is stable until somebody explicitly resumes the owning campaign.
-      // Polling it as if it were still active leaves Deep Research at 4% forever.
+      const terminalFailures = result.states.filter((state) =>
+        state.status === 'failed' || result.latestJobs.get(state.nodusId)?.status === 'failed'
+      );
+      const unavailable = result.states.filter((state) => state.status === 'unavailable');
+      const paused = result.states.filter((state) =>
+        state.status === 'paused' || result.latestJobs.get(state.nodusId)?.status === 'paused'
+      );
       if (paused.length) {
         throw new Error(
           `${paused.length} obra(s) quedaron en pausa durante la preparación documental. Reanuda su análisis o vuelve a intentarlo cuando la fuente esté estable.`
         );
       }
-      if ((failed.length && !options.allowFailed) || (unavailable.length && !options.allowUnavailable)) {
-        throw new Error(`No se pudieron preparar ${failed.length + unavailable.length} obra(s) necesarias para la investigación.`);
+      if ((terminalFailures.length && !options.allowFailed) || (unavailable.length && !options.allowUnavailable)) {
+        throw new Error(`No se pudieron preparar ${terminalFailures.length + unavailable.length} obra(s) necesarias para la investigación.`);
       }
-      await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+      await sleep(POLL_MS);
       options.signal?.throwIfAborted();
-      result = await withVaultDatabase(vaultId, () => documentProfileStatuses(ids));
+      result = await withVaultDatabase(vaultId, preparationSnapshot);
     }
   }
 
@@ -540,6 +563,8 @@ class DocumentIndexQueue {
         });
         const message = error instanceof Error ? error.message : String(error);
         const current = listDocumentIndexJobs().find((item) => item.jobId === job.jobId) ?? job;
+        const classified = classifyPipelineError(error, 'indexing');
+        const failureCode = classified.code === 'unknown' ? 'index_failed' : classified.code;
         if (current.status === 'cancelled' || message === 'DOCUMENT_INDEX_CANCELLED') {
           logPipelineWarning({ subject: 'subjectIndexing', code: 'cancelled', reason: 'reasonCancelled', detail: work.title });
           return;
@@ -553,11 +578,10 @@ class DocumentIndexQueue {
           logPipelineWarning({ subject: 'subjectIndexing', code: 'source_changed', reason: 'reasonSourceChanged', detail: work.title });
           return;
         }
-        const unavailable = /sin texto|no hay texto|no contiene texto/i.test(message);
-        if (unavailable) {
+        if (error instanceof DocumentSourceUnavailableError) {
           updateDocumentIndexJob(job.jobId, { status: 'unavailable', phase: 'done', progress: 1, error: message });
           setDocumentProfileState(job.nodusId, 'unavailable', { error: message });
-          logPipelineWarning({ subject: 'subjectIndexing', code: 'no_legible_text', reason: 'reasonNoLegibleText', detail: work.title });
+          logPipelineWarning({ error, subject: 'subjectIndexing', code: 'no_legible_text', reason: 'reasonNoLegibleText', detail: work.title });
         } else if (error instanceof AiError && error.config && job.campaignId) {
           updateDocumentIndexJob(job.jobId, { status: 'paused', phase: 'paused', progress: current.progress, error: message });
           setDocumentProfileState(job.nodusId, 'paused', { error: message });
@@ -567,8 +591,9 @@ class DocumentIndexQueue {
           updateDocumentIndexJob(job.jobId, { status: 'queued', phase: 'queued', progress: current.progress, error: message });
           setDocumentProfileState(job.nodusId, 'queued', { error: message });
           logPipelineWarning({
+            error,
             subject: 'subjectIndexing',
-            code: 'index_failed',
+            code: failureCode,
             message: {
               id: 'logRetry',
               params: { subject: { id: 'subjectIndexing' }, attempt: current.attempts + 1, max: current.maxAttempts },
@@ -577,8 +602,14 @@ class DocumentIndexQueue {
           });
         } else {
           updateDocumentIndexJob(job.jobId, { status: 'failed', phase: 'done', progress: current.progress, error: message });
-          setDocumentProfileState(job.nodusId, 'failed', { error: message });
-          logPipelineFailure({ error, code: 'index_failed', subject: 'subjectIndexing', detail: message });
+          restoreDocumentProfileStateAfterFailure(job.nodusId, message, current.sourceFingerprint);
+          logPipelineFailure({
+            error,
+            code: failureCode,
+            subject: 'subjectIndexing',
+            detail: message,
+            ...(failureCode === 'db_error' ? { context: { provider: null, model: null } } : {}),
+          });
         }
         this.logCampaignOutcome(vault, job.campaignId);
       }

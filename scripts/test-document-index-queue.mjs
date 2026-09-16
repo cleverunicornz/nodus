@@ -3,6 +3,7 @@ import test from 'node:test';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { build } from 'esbuild';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -18,8 +19,9 @@ globalThis.__documentQueue = {
   ],
   works: new Map([['v1',[{nodus_id:'v1-w',title:'Obra V1'}]],['v2',[{nodus_id:'v2-w',title:'Obra V2'}]]]),
   data: new Map(), runs: [], seq: 0, continuousEnabled: false, failWorks: new Set(),
-  logs: [],
-  blockWorks: new Set(), abortedWorks: [], configWorks: new Set(), sourceChangedWorks: new Set(), sourceResetProgress: [],
+  logs: [], sleep,
+  blockWorks: new Set(), abortedWorks: [], configWorks: new Set(), unavailableWorks: new Set(),
+  staleRestoreWorks: new Set(), sourceChangedWorks: new Set(), sourceResetProgress: [],
   failVaultOpen: new Set(),
 };
 const state = (id) => {
@@ -55,14 +57,16 @@ await build({
       export function requeueDocumentIndexJobForSourceChange(id){const j=data().jobs.find(x=>x.jobId===id);j.status='queued';j.phase='queued';j.progress=0;j.error='La obra cambió';globalThis.__documentQueue.sourceResetProgress.push(j.progress);data().profiles.set(j.nodusId,'queued');return 'queued'}
       export function cancelDocumentIndexJob(id){const job=updateDocumentIndexJob(id,{status:'cancelled',error:'Cancelado por el usuario.'});if(job)data().profiles.set(job.nodusId,'missing');return job}
       export function setDocumentProfileState(id,status){data().profiles.set(id,status)}
+      export function restoreDocumentProfileStateAfterFailure(id){data().profiles.set(id,globalThis.__documentQueue.staleRestoreWorks.has(id)?'stale':'failed')}
     `);
     stub(/\.\.\/vaults\/vaultRegistry$/,'vaults',`export function listVaults(){return globalThis.__documentQueue.vaults}export function getVault(id){return globalThis.__documentQueue.vaults.find(v=>v.id===id)||null}`);
-    stub(/\.\.\/ai\/documentProfile$/,'scan',`export async function runDocumentProfileScan(work,options){const vault=globalThis.__documentQueue.storage.getStore();globalThis.__documentQueue.runs.push({vault,work:work.nodus_id});options?.onProgress?.({phase:'analyzing_sections',progress:.4,message:'working'});if(globalThis.__documentQueue.blockWorks.has(work.nodus_id)){await new Promise((resolve,reject)=>{const stop=()=>{globalThis.__documentQueue.blockWorks.delete(work.nodus_id);globalThis.__documentQueue.abortedWorks.push(work.nodus_id);reject(new Error('aborted'))};if(options.signal?.aborted)stop();else options.signal?.addEventListener('abort',stop,{once:true})})}await new Promise(r=>setTimeout(r,5));if(globalThis.__documentQueue.sourceChangedWorks.delete(work.nodus_id))throw new Error('DOCUMENT_SOURCE_CHANGED');if(globalThis.__documentQueue.configWorks.has(work.nodus_id))throw new globalThis.__documentQueue.AiError('Clave inválida',false,true);if(globalThis.__documentQueue.failWorks.has(work.nodus_id))throw new Error('provider rejected this document');return 'version'}`);
+    stub(/\.\.\/ai\/documentProfile$/,'scan',`export class DocumentSourceUnavailableError extends Error{constructor(message){super(message);this.code='no_legible_text'}}export async function runDocumentProfileScan(work,options){const vault=globalThis.__documentQueue.storage.getStore();globalThis.__documentQueue.runs.push({vault,work:work.nodus_id});options?.onProgress?.({phase:'analyzing_sections',progress:.4,message:'working'});if(globalThis.__documentQueue.blockWorks.has(work.nodus_id)){const gate=Promise.withResolvers();const stop=()=>{globalThis.__documentQueue.blockWorks.delete(work.nodus_id);globalThis.__documentQueue.abortedWorks.push(work.nodus_id);gate.reject(new Error('aborted'))};if(options.signal?.aborted)stop();else options.signal?.addEventListener('abort',stop,{once:true});await gate.promise}await globalThis.__documentQueue.sleep(5);if(globalThis.__documentQueue.sourceChangedWorks.delete(work.nodus_id))throw new Error('DOCUMENT_SOURCE_CHANGED');if(globalThis.__documentQueue.configWorks.has(work.nodus_id))throw new globalThis.__documentQueue.AiError('Clave inválida',false,true);if(globalThis.__documentQueue.unavailableWorks.has(work.nodus_id))throw new DocumentSourceUnavailableError('Archivo adjunto no encontrado en su ubicación original.');if(globalThis.__documentQueue.failWorks.has(work.nodus_id))throw new Error('provider rejected this document');return 'version'}`);
     stub(/\.\.\/ai\/aiClient$/,'ai',`export class AiError extends Error{constructor(message,retriable=false,config=false){super(message);this.retriable=retriable;this.config=config}}globalThis.__documentQueue.AiError=AiError`);
     stub(/\.\.\/util\/coalesce$/,'coalesce',`export function coalesce(fn){return {schedule:fn}}`);
     // The processing log, recorded instead of written. The scope is pushed so the assertions
     // can prove the attribution (vault + document + job) reaches every line.
     stub(/\.\.\/logging\/pipelineLogCore$/,'log',`
+      export function classifyPipelineError(error){return {code:error?.code||'unknown',category:'indexing',detail:error?.message||String(error),retriable:Boolean(error?.retriable),httpStatus:null,stack:null}}
       export function withPipelineLogScope(context,work){globalThis.__documentQueue.logs.push({kind:'scope',context});return work()}
       export function logPipelineSuccess(input){globalThis.__documentQueue.logs.push({kind:'success',...input})}
       export function logPipelineWarning(input){globalThis.__documentQueue.logs.push({kind:'warning',...input})}
@@ -101,9 +105,29 @@ test('continuous mode stays disabled until the beta policy is reopened',async()=
 
 test('deliberate research may continue when one optional profile fails',async()=>{
   globalThis.__documentQueue.works.get('v1').push({nodus_id:'v1-fail',title:'Obra no preparable'});
+
   globalThis.__documentQueue.failWorks.add('v1-fail');
   await documentIndexQueue.ensureProfiles('v1',['v1-fail'],'research',{allowUnavailable:true,allowFailed:true});
   assert.equal(globalThis.__documentQueue.data.get('v1').profiles.get('v1-fail'),'failed');
+});
+test('structured source unavailability is terminal without matching localized prose',async()=>{
+  globalThis.__documentQueue.works.get('v1').push({nodus_id:'v1-unavailable',title:'Obra sin archivo'});
+  globalThis.__documentQueue.unavailableWorks.add('v1-unavailable');
+  await documentIndexQueue.ensureProfiles('v1',['v1-unavailable'],'research',{allowUnavailable:true});
+  assert.equal(globalThis.__documentQueue.data.get('v1').profiles.get('v1-unavailable'),'unavailable');
+});
+
+test('a failed refresh restored to stale terminates an allow-failed preparation barrier',async()=>{
+  globalThis.__documentQueue.works.get('v1').push({nodus_id:'v1-stale-failure',title:'Obra previa obsoleta'});
+  globalThis.__documentQueue.data.get('v1').profiles.set('v1-stale-failure','stale');
+  globalThis.__documentQueue.staleRestoreWorks.add('v1-stale-failure');
+  globalThis.__documentQueue.failWorks.add('v1-stale-failure');
+  await Promise.race([
+    documentIndexQueue.ensureProfiles('v1',['v1-stale-failure'],'research',{allowFailed:true}),
+    sleep(500).then(()=>{throw new Error('barrier timed out')}),
+  ]);
+  assert.equal(globalThis.__documentQueue.data.get('v1').profiles.get('v1-stale-failure'),'stale');
+  assert.equal(globalThis.__documentQueue.data.get('v1').jobs.find(job=>job.nodusId==='v1-stale-failure')?.status,'failed');
 });
 
 test('a paused profile terminates the research barrier instead of polling forever',async()=>{

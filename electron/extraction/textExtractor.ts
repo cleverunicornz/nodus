@@ -11,6 +11,7 @@ import type {
   ResolvedTextState,
   WorkTextSource,
   TextBlockReason,
+  ExtractionControlDiagnostics,
 } from '@shared/types';
 import { itemChildren, itemAsAttachment, getFulltext, attachmentFilePath, ZoteroAttachment, ZoteroRequestError } from '../zotero/zoteroClient';
 import { openPdf, pageText } from './pdfjsLoader';
@@ -20,7 +21,12 @@ import { csvFileToText, xlsxFileToText } from './tabular';
 import { getExtractionCache, upsertExtractionCache } from '../db/extractionCacheRepo';
 import { perfLog, startPerf, type PerfContext } from '../perf';
 import { getLibraryReaderRawContent } from '../libraryReader/libraryReaderStore';
-import { cleanExtractedText } from './textCleanup';
+import {
+  cleanExtractedText,
+  cleanExtractedTextWithDiagnostics,
+  mergeControlDiagnostics,
+  replaceDisallowedControls,
+} from './textCleanup';
 import type { PipelineLogReasonId } from '@shared/pipelineLogMessages';
 import { logPipelineWarning } from '../logging/pipelineLogCore';
 
@@ -29,6 +35,7 @@ export interface ExtractedDoc {
   sourceType: SourceType;
   notes: string | null;
   analysis?: PdfAnalysis;
+  controlDiagnostics?: ExtractionControlDiagnostics;
   /**
    * True when the Zotero item exposes a document attachment (PDF/EPUB/…), even if
    * it could not be read on this pass. Lets the pipeline distinguish "no full text
@@ -51,6 +58,7 @@ export interface ExtractedTextSegment {
   contentHash: string;
   pageCount: number | null;
   hasPageMarkers: boolean;
+  controlDiagnostics?: ExtractionControlDiagnostics;
 }
 
 export interface ExtractProgress {
@@ -132,6 +140,19 @@ function sourceMarkedText(text: string, marker: string): string {
   const replaced = text.replace(/\[\[p\.\s*(\d+)\]\]/gi, `[[src:${marker} p.$1]]`);
   return /\[\[src:/i.test(replaced) ? replaced : `[[src:${marker}]]\n${replaced}`;
 }
+function hasControlDiagnostics(value?: ExtractionControlDiagnostics | null): boolean {
+  return Boolean(value && (value.replacements > 0 || value.preexistingReplacementCharacters > 0));
+}
+
+function controlWarning(value: ExtractionControlDiagnostics, label?: string | null): string | null {
+  if (!hasControlDiagnostics(value)) return null;
+  const pages = value.pages?.map((page) => page.page).join(', ');
+  const subject = label ? `${label}: ` : '';
+  return `${subject}${value.replacements} carácter(es) de control se conservaron como �`
+    + `${value.preexistingReplacementCharacters ? `; ${value.preexistingReplacementCharacters} � ya existían` : ''}`
+    + `${pages ? ` (páginas ${pages})` : ''}.`;
+}
+
 
 function combineSegments(segments: ExtractedTextSegment[], notes: string | null, hadTextAttachment: boolean): ExtractedDoc {
   const unique: ExtractedTextSegment[] = [];
@@ -143,11 +164,19 @@ function combineSegments(segments: ExtractedTextSegment[], notes: string | null,
     unique.push({ ...segment, marker });
   }
   const text = unique.map((segment) => sourceMarkedText(segment.text, segment.marker)).join('\n\n');
+  const controlDiagnostics: ExtractionControlDiagnostics = {
+    replacements: unique.reduce((sum, segment) => sum + (segment.controlDiagnostics?.replacements ?? 0), 0),
+    preexistingReplacementCharacters: unique.reduce(
+      (sum, segment) => sum + (segment.controlDiagnostics?.preexistingReplacementCharacters ?? 0), 0,
+    ),
+    pages: unique.flatMap((segment) => segment.controlDiagnostics?.pages ?? []),
+  };
   return {
     text,
     sourceType: unique[0]?.sourceType ?? 'none',
     notes,
     analysis: undefined,
+    controlDiagnostics: hasControlDiagnostics(controlDiagnostics) ? controlDiagnostics : undefined,
     hadTextAttachment,
     segments: unique,
   };
@@ -167,6 +196,7 @@ export function resolvedTextStateFromDoc(doc: ExtractedDoc): ResolvedTextState {
     contentHash: textHash(doc.text),
     pageCount: doc.analysis?.pageCount ?? null,
     hasPageMarkers: /\[\[p\.\s*\d+\]\]/i.test(doc.text),
+    controlDiagnostics: doc.controlDiagnostics,
   }] : []);
   const sourceTypes = new Set(segments.map((segment) => segment.sourceType));
   const sources: WorkTextSource[] = segments.map((segment, ordinal) => ({
@@ -309,10 +339,15 @@ export function planTextChunks(text: string, opts: ChunkOptions = {}): ChunkPlan
 
 export interface RetrievalChunk {
   text: string;
-  /** The most recent PDF page marker that precedes this chunk, if present. */
+  /** The page containing the first/last content token in this chunk. */
   pageLabel: string | null;
+  pageEndLabel: string | null;
   sourceRef: string | null;
   pageNumber: number | null;
+  pageEndNumber: number | null;
+  /** Zero-based, half-open UTF-16 offsets into the marked resolved source. */
+  charStart: number;
+  charEnd: number;
 }
 
 /**
@@ -326,12 +361,21 @@ export function planRetrievalChunks(
 ): RetrievalChunk[] {
   const chunkWords = clampInt(opts.chunkWords, RETRIEVAL_CHUNK_WORDS, 80, 1000);
   const overlapWords = clampInt(opts.overlapWords, RETRIEVAL_OVERLAP_WORDS, 0, Math.max(0, chunkWords - 1));
-  const tokens: { value: string; pageLabel: string | null; sourceRef: string | null; pageNumber: number | null }[] = [];
+  const tokens: Array<{
+    value: string;
+    pageLabel: string | null;
+    sourceRef: string | null;
+    pageNumber: number | null;
+    charStart: number;
+    charEnd: number;
+  }> = [];
   let pageLabel: string | null = null;
   let pageNumber: number | null = null;
   let sourceRef: string | null = null;
-  const rawTokens = text.match(/\[\[src:[^\]\s]+(?:\s+p\.\s*\d+)?\]\]|\[\[p\.\s*\d+\]\]|\S+/gi) ?? [];
-  for (const raw of rawTokens) {
+  const rawTokens = text.matchAll(/\[\[src:[^\]\s]+(?:\s+p\.\s*\d+)?\]\]|\[\[p\.\s*\d+\]\]|\S+/gi);
+  for (const rawMatch of rawTokens) {
+    const raw = rawMatch[0];
+    const charStart = rawMatch.index ?? 0;
     const sourceMarker = raw.match(/^\[\[src:([^\]\s]+)(?:\s+p\.\s*(\d+))?\]\]$/i);
     if (sourceMarker) {
       sourceRef = opts.sourceMap?.[sourceMarker[1]] ?? sourceMarker[1];
@@ -345,7 +389,7 @@ export function planRetrievalChunks(
       pageLabel = `p. ${pageNumber}`;
       continue;
     }
-    tokens.push({ value: raw, pageLabel, sourceRef, pageNumber });
+    tokens.push({ value: raw, pageLabel, sourceRef, pageNumber, charStart, charEnd: charStart + raw.length });
   }
   if (tokens.length === 0) return [];
 
@@ -358,8 +402,12 @@ export function planRetrievalChunks(
     chunks.push({
       text: slice.map((token) => token.value).join(' '),
       pageLabel: slice[0]?.pageLabel ?? null,
+      pageEndLabel: slice.at(-1)?.pageLabel ?? null,
       sourceRef: slice[0]?.sourceRef ?? null,
       pageNumber: slice[0]?.pageNumber ?? null,
+      pageEndNumber: slice.at(-1)?.pageNumber ?? null,
+      charStart: slice[0]?.charStart ?? 0,
+      charEnd: slice.at(-1)?.charEnd ?? 0,
     });
     if (end >= sourceEnd) start = sourceEnd;
     else start = Math.max(start + 1, end - overlapWords);
@@ -404,6 +452,7 @@ export async function extractPdfStreaming(
   const pageTexts = new Map<number, string>();
   const blanks: number[] = [];
   const lowQuality: number[] = [];
+  const controlByPage = new Map<number, ExtractionControlDiagnostics>();
 
   for (let p = 1; p <= total; p++) {
     if (opts.signal?.aborted) {
@@ -412,7 +461,10 @@ export async function extractPdfStreaming(
     }
     opts.onProgress?.({ phase: 'extract', detail: `Extrayendo p. ${p}/${total}`, pct: p / total });
     const page = await pdf.getPage(p);
-    const txt = cleanExtractedText(await pageText(page));
+    let pageControls: ExtractionControlDiagnostics = { replacements: 0, preexistingReplacementCharacters: 0 };
+    const rawText = await pageText(page, { onControlDiagnostics: (value) => { pageControls = value; } });
+    const txt = cleanExtractedText(rawText);
+    if (hasControlDiagnostics(pageControls)) controlByPage.set(p, pageControls);
     page.cleanup?.();
     if (txt.length >= MIN_CHARS_TEXT_PAGE) {
       pageTexts.set(p, txt);
@@ -436,11 +488,14 @@ export async function extractPdfStreaming(
       );
       opts.signal?.throwIfAborted();
       for (const [p, result] of map) {
-        const cleaned = cleanExtractedText(result.text ?? '');
+        const normalized = cleanExtractedTextWithDiagnostics(result.text ?? '');
+        const cleaned = normalized.text;
         if (cleaned.length >= MIN_CHARS_TEXT_PAGE) {
           const previous = pageTexts.get(p);
           if (!previous || textQualityScore(cleaned) > textQualityScore(previous) + 0.05) {
             pageTexts.set(p, cleaned);
+            if (hasControlDiagnostics(normalized.diagnostics)) controlByPage.set(p, normalized.diagnostics);
+            else controlByPage.delete(p);
             ocredPages++;
           }
         }
@@ -472,11 +527,25 @@ export async function extractPdfStreaming(
   const notes: string[] = [];
   if (ocredPages) notes.push(`${ocredPages} página(s) recuperadas por OCR.`);
   if (skippedPages) notes.push(`${skippedPages} página(s) sin texto omitidas.`);
+  const controlPages = [...controlByPage.entries()].map(([page, value]) => ({ page, ...value }));
+  const controlDiagnostics: ExtractionControlDiagnostics = {
+    replacements: controlPages.reduce((sum, page) => sum + page.replacements, 0),
+    preexistingReplacementCharacters: controlPages.reduce(
+      (sum, page) => sum + page.preexistingReplacementCharacters, 0,
+    ),
+    pages: controlPages,
+  };
+  const warning = controlWarning(controlDiagnostics, path.basename(filePath));
+  if (warning) notes.push(warning);
+  const analyzed: PdfAnalysis = hasControlDiagnostics(controlDiagnostics)
+    ? { ...analysis, controlDiagnostics }
+    : analysis;
 
   return {
     text: parts.join('\n\n'),
     sourceType: 'pdf',
-    analysis,
+    analysis: analyzed,
+    controlDiagnostics: hasControlDiagnostics(controlDiagnostics) ? controlDiagnostics : undefined,
     notes: notes.length ? notes.join(' ') : null,
   };
 }
@@ -526,6 +595,20 @@ async function extractImage(
     return { text: '', sourceType: 'upload', notes: 'OCR de imagen no disponible.', blockReason: 'unreadable' };
   }
 }
+function sanitizeUnstructuredDocument(doc: ExtractedDoc, label: string): ExtractedDoc {
+  if (doc.controlDiagnostics) return doc;
+  const sanitized = replaceDisallowedControls(doc.text);
+  const diagnostics: ExtractionControlDiagnostics = sanitized.diagnostics;
+  if (!hasControlDiagnostics(diagnostics)) return { ...doc, text: sanitized.text };
+  const warning = controlWarning(diagnostics, label);
+  return {
+    ...doc,
+    text: sanitized.text,
+    controlDiagnostics: diagnostics,
+    notes: [doc.notes, warning].filter(Boolean).join(' ') || null,
+  };
+}
+
 
 function decodeHtmlEntities(text: string): string {
   const named: Record<string, string> = {
@@ -684,6 +767,7 @@ export async function extractFromPath(
     throw new Error(`Tipo de archivo no soportado: ${ext}`);
   }
 
+  doc = sanitizeUnstructuredDocument(doc, path.basename(filePath));
   opts.signal?.throwIfAborted();
   upsertExtractionCache(cacheKey, doc);
   perfLog('extraction cache write', 0, opts.perf, { file: path.basename(filePath), chars: doc.text.length });
@@ -857,6 +941,7 @@ async function readTextAttachments(
         contentHash: textHash(localDoc.text),
         pageCount: localDoc.analysis?.pageCount ?? null,
         hasPageMarkers: hasPages,
+        controlDiagnostics: localDoc.controlDiagnostics,
       });
       if (localDoc.notes) notes.push(localDoc.notes);
       continue;
@@ -867,9 +952,16 @@ async function readTextAttachments(
     if (opts.preferZoteroFulltext) {
       opts.onProgress?.({ phase: 'fulltext', detail: 'Comprobando índice de Zotero…', pct: null });
       const ft = await getFulltext(userId, att.key).catch(() => null);
-      const cleaned = ft ? cleanExtractedText(ft.content) : '';
+      const normalized = ft ? cleanExtractedTextWithDiagnostics(ft.content) : null;
+      const cleaned = normalized?.text ?? '';
       if (ft && hasUsableText(cleaned)) {
-        const note = `Texto indexado por Zotero sin páginas verificables${ft.totalPages ? ` (${ft.indexedPages ?? '?'}/${ft.totalPages} págs. indexadas)` : ''}.`;
+        const diagnostic = normalized && hasControlDiagnostics(normalized.diagnostics)
+          ? controlWarning(normalized.diagnostics, att.title || att.filename)
+          : null;
+        const note = [
+          `Texto indexado por Zotero sin páginas verificables${ft.totalPages ? ` (${ft.indexedPages ?? '?'}/${ft.totalPages} págs. indexadas)` : ''}.`,
+          diagnostic,
+        ].filter(Boolean).join(' ');
         segments.push({
           sourceRef: sourceRefForAttachment(att),
           marker: '',
@@ -882,6 +974,7 @@ async function readTextAttachments(
           contentHash: textHash(cleaned),
           pageCount: ft.totalPages ?? null,
           hasPageMarkers: false,
+          controlDiagnostics: normalized?.diagnostics,
         });
         notes.push(note);
       }

@@ -16,15 +16,27 @@ import { getSettings } from '../db/settingsRepo';
 import {
   advanceRunningDocumentIndexJob,
   clearDocumentCheckpoints,
+  DocumentProfilePublicationError,
   publishDocumentProfile,
   readDocumentCheckpoint,
   saveDocumentCheckpoint,
-  setDocumentProfileState,
   updateDocumentIndexJob,
 } from '../db/documentProfilesRepo';
 import { cosineSimilarity, currentEmbeddingConfig, decodeEmbedding } from '../db/ideasRepo';
 import type { PassageInsert } from '../db/passagesRepo';
-import { planRetrievalChunks, resolveWorkText, resolvedTextStateFromDoc } from '../extraction/textExtractor';
+import {
+  planRetrievalChunks,
+  resolveWorkText,
+  resolvedTextStateFromDoc,
+  type ExtractedDoc,
+  type RetrievalChunk,
+} from '../extraction/textExtractor';
+import {
+  findLiteralSourceSpans,
+  intactSourceExcerpt,
+  selectLiteralPassageIndex,
+  type SourceTextSpan,
+} from '../extraction/sourceTextRanges';
 import { setResolvedTextState } from '../db/worksRepo';
 import { analysisFingerprint, analysisModelFingerprint, upsertLibraryAnalysisProvenance } from '../db/libraryAnalysisProvenance';
 import { getItem, LOCAL_USER_ID } from '../zotero/zoteroClient';
@@ -33,10 +45,26 @@ import { mapOrderedPool } from './orderedPool';
 import { modelRefSupportsCapability } from '@shared/localAiModels';
 import type { PerfContext } from '../perf';
 import { documentProfilePromptPack } from '@shared/academicPromptPacks';
+import {
+  DOCUMENT_PROFILE_PIPELINE_VERSION,
+  DOCUMENT_PROFILE_SCHEMA_VERSION,
+} from '@shared/documentProfilePolicy';
 import { logPipelineSuccess } from '../logging/pipelineLogCore';
 
-export const DOCUMENT_PROFILE_PIPELINE_VERSION = 'document-profile/5';
-export const DOCUMENT_PROFILE_SCHEMA_VERSION = 2;
+export { DOCUMENT_PROFILE_PIPELINE_VERSION, DOCUMENT_PROFILE_SCHEMA_VERSION };
+
+export class DocumentSourceUnavailableError extends Error {
+  readonly code = 'no_legible_text';
+
+  constructor(
+    message: string,
+    readonly sourceType: ExtractedDoc['sourceType'],
+    readonly blockReason: ExtractedDoc['blockReason'] = null,
+  ) {
+    super(message);
+    this.name = 'DocumentSourceUnavailableError';
+  }
+}
 const ANALYSIS_WORDS = 2_500;
 const MIN_SECTION_WORDS = 80;
 const DIRECT_SUPPORT_CONFIDENCE_FLOOR = 0.8;
@@ -63,6 +91,7 @@ interface RawClaim { text: string; support_quote: string; page: string | null; c
  *  quotation. */
 interface SectionAnalysis { title: string; summary: string; role: string; concepts: string[]; claims: RawClaim[]; degraded?: boolean }
 interface RawProfileField {
+  handle?: string;
   kind: DocumentProfileFieldKind;
   text: string;
   confidence: number;
@@ -70,24 +99,58 @@ interface RawProfileField {
   support_quote: string;
   page: string | null;
   /** Set when the published confidence is the deterministic floor rather than a
-   *  value the provider measured (see `retainLiterallySupportedFields`). */
+   * value the provider measured (see `retainLiterallySupportedFields`). */
   confidenceSource?: DocumentProfileConfidenceSource;
 }
 interface ProfileSynthesis { source_language: string; overview: string; fields: RawProfileField[] }
+type AuditTargetKind = 'overview' | 'field' | 'section' | 'claim' | 'profile';
+interface AuditIssue {
+  code: string;
+  blocking: boolean;
+  target: { kind: AuditTargetKind; handle: string | null };
+  explanation: string;
+}
+type FieldOperationKind = 'remove_field' | 'edit_field' | 'add_field';
+interface FieldOperation {
+  op: FieldOperationKind;
+  target: string | null;
+  kind: DocumentProfileFieldKind | null;
+  text: string | null;
+  supportQuote: string | null;
+  evidenceHandle: string | null;
+  confidence: number | null;
+  centrality: number | null;
+}
 interface AuditResponse {
+  candidateRevision: string;
   passed: boolean;
   /** null when the provider reported no usable score: "no reading", not "scored zero". */
   score: number | null;
-  issues: string[];
-  field_fixes: Array<{ index: number; text: string; support_quote: string }>;
-  overview: string;
+  issues: AuditIssue[];
+  operations: FieldOperation[];
+  overview: string | null;
+}
+interface RepairDelta {
+  baseRevision: string;
+  operations: FieldOperation[];
+  overview: string | null;
+}
+interface EvidenceHandle {
+  handle: string;
+  sectionId: string;
+  quote: string;
+  page: string | null;
 }
 interface SectionAuditResponse { passed: boolean; issues: string[]; analysis: SectionAnalysis | null }
-interface PreparedPassages {
+interface PreparedPassagePublication {
   contentHash: string;
   rows: PassageInsert[];
   embeddingProvider: string;
   embeddingModel: string;
+}
+interface PreparedPassages {
+  rows: RetrievalChunk[];
+  publication: PreparedPassagePublication | null;
 }
 
 function isSectionAuditResponse(value: unknown): value is SectionAuditResponse {
@@ -168,6 +231,28 @@ const page = (value: unknown): string | null => {
 };
 const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
 const sha1 = (value: string): string => createHash('sha1').update(value).digest('hex');
+export function documentProfileCheckpointFingerprint(input: {
+  pipelineVersion: string;
+  kind: string;
+  language: PromptLanguage;
+  generatorModel: ModelRef | null;
+  auditorModel: ModelRef | null;
+  payload: unknown;
+}): string {
+  return sha256(JSON.stringify(input));
+}
+
+function profileCheckpointHash(kind: string, payload: unknown, options: RunDocumentProfileOptions): string {
+  return documentProfileCheckpointFingerprint({
+    pipelineVersion: DOCUMENT_PROFILE_PIPELINE_VERSION,
+    kind,
+    language: options.language ?? getSettings().promptLanguage ?? 'es',
+    generatorModel: options.generatorModel,
+    auditorModel: options.auditorModel,
+    payload,
+  });
+}
+
 
 function isSectionAnalysis(value: unknown): value is SectionAnalysis {
   // Providers commonly omit optional empty arrays or wrap the requested object.
@@ -269,16 +354,74 @@ function normalizeProfile(value: unknown): ProfileSynthesis {
 }
 
 function isAuditResponse(value: unknown): value is AuditResponse {
-  // Gemini Flash Lite occasionally returns a structurally useful audit with a
-  // numeric string, a single issue string or an omitted optional repair list.
-  // Rejecting that whole object turns an ordinary "repair this profile" verdict
-  // into a terminal schema error. The normalizer below remains conservative:
-  // absent/unknown verdicts become failed, never passed.
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
-/** Normalize provider JSON without ever promoting an ambiguous audit to passed. */
-export function normalizeDocumentProfileAuditResponse(value: unknown): AuditResponse {
+function strictOptionalString(value: unknown, max: number): string | null {
+  if (value == null || value === '') return null;
+  if (typeof value !== 'string') return null;
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  return normalized && normalized.length <= max ? normalized : null;
+}
+
+function normalizeAuditIssue(value: unknown): AuditIssue | null {
+  if (typeof value === 'string') {
+    const explanation = strictOptionalString(value, 1_000);
+    return explanation ? {
+      code: 'legacy_unlocalized_issue',
+      blocking: true,
+      target: { kind: 'profile', handle: null },
+      explanation,
+    } : null;
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const item = value as Record<string, unknown>;
+  const rawTarget = item.target && typeof item.target === 'object' && !Array.isArray(item.target)
+    ? item.target as Record<string, unknown>
+    : {};
+  const kind = strictOptionalString(rawTarget.kind, 20) as AuditTargetKind | null;
+  if (!kind || !['overview', 'field', 'section', 'claim', 'profile'].includes(kind)) return null;
+  const explanation = strictOptionalString(item.explanation, 1_000);
+  if (!explanation) return null;
+  return {
+    code: strictOptionalString(item.code, 80) ?? 'audit_issue',
+    blocking: item.blocking !== false,
+    target: {
+      kind,
+      handle: kind === 'overview' || kind === 'profile' ? null : strictOptionalString(rawTarget.handle, 200),
+    },
+    explanation,
+  };
+}
+
+function normalizeFieldOperation(value: unknown): FieldOperation | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const item = value as Record<string, unknown>;
+  const op = strictOptionalString(item.op, 30) as FieldOperationKind | null;
+  if (!op || !['remove_field', 'edit_field', 'add_field'].includes(op)) return null;
+  const kind = strictOptionalString(item.kind, 40) as DocumentProfileFieldKind | null;
+  const target = strictOptionalString(item.target, 200);
+  const text = strictOptionalString(item.text, 3_000);
+  const supportQuote = strictOptionalString(item.support_quote, 1_200);
+  const evidenceHandle = strictOptionalString(item.evidence_handle, 240);
+  if (item.kind != null && (!kind || !FIELD_KINDS.has(kind))) return null;
+  if (item.target != null && !target) return null;
+  if (item.text != null && !text) return null;
+  if (item.support_quote != null && !supportQuote) return null;
+  if (item.evidence_handle != null && !evidenceHandle) return null;
+  return {
+    op, target, kind, text, supportQuote, evidenceHandle,
+    confidence: item.confidence == null ? null : number01(item.confidence),
+    centrality: item.centrality == null ? null : number01(item.centrality),
+  };
+}
+
+/** Normalize provider JSON without ever promoting an ambiguous or stale audit. */
+export function normalizeDocumentProfileAuditResponse(
+  value: unknown,
+  expectedRevision = '',
+  fieldHandles: string[] = [],
+): AuditResponse {
   const root = value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
@@ -286,24 +429,228 @@ export function normalizeDocumentProfileAuditResponse(value: unknown): AuditResp
     ? root.audit as Record<string, unknown>
     : null;
   const item = nested ?? root;
-  const rawPassed = item.passed;
-  const passed = verdictPassed(rawPassed);
+  const candidateRevision = strictOptionalString(item.candidate_revision, 128) ?? '';
   const rawIssues = Array.isArray(item.issues) ? item.issues : item.issues == null ? [] : [item.issues];
-  const rawFixes = Array.isArray(item.field_fixes) ? item.field_fixes : [];
+  const issues = rawIssues.map(normalizeAuditIssue).filter((issue): issue is AuditIssue => !!issue).slice(0, 50);
+  const rawOperations = Array.isArray(item.operations) ? item.operations : [];
+  const parsedOperations = rawOperations.map(normalizeFieldOperation);
+  const invalidOperations = rawOperations.length > 32 || parsedOperations.some((operation) => !operation);
+  const operations = invalidOperations
+    ? []
+    : parsedOperations.filter((operation): operation is FieldOperation => !!operation).slice(0, 32);
+  if (invalidOperations) {
+    issues.unshift({
+      code: 'invalid_repair_operations',
+      blocking: true,
+      target: { kind: 'profile', handle: null },
+      explanation: 'One or more proposed repair operations were invalid or exceeded the bounded operation limit.',
+    });
+  }
+  // Read old provider/test fixtures conservatively during the protocol cutover.
+  const legacyFixes = (Array.isArray(item.field_fixes) ? item.field_fixes : []).flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return [];
+    const fix = entry as Record<string, unknown>;
+    const index = Math.trunc(Number(fix.index));
+    const target = fieldHandles[index];
+    if (!Number.isFinite(index) || index < 0 || !target) return [];
+    return [{
+      op: 'edit_field' as const,
+      target,
+      kind: null,
+      text: strictOptionalString(fix.text, 3_000),
+      supportQuote: strictOptionalString(fix.support_quote, 1_200),
+      evidenceHandle: strictOptionalString(fix.evidence_handle, 240),
+      confidence: null,
+      centrality: null,
+    }];
+  });
+  if (expectedRevision && candidateRevision !== expectedRevision) {
+    issues.unshift({
+      code: 'stale_candidate_revision',
+      blocking: true,
+      target: { kind: 'profile', handle: null },
+      explanation: 'The audit verdict did not echo the exact candidate revision.',
+    });
+  }
+  if (item.overview != null && !strictOptionalString(item.overview, 5_000)) {
+    issues.unshift({
+      code: 'invalid_overview_fix',
+      blocking: true,
+      target: { kind: 'overview', handle: null },
+      explanation: 'The proposed overview replacement is empty, invalid, or oversized.',
+    });
+  }
   return {
-    passed,
+    candidateRevision,
+    passed: verdictPassed(item.passed) && (!expectedRevision || candidateRevision === expectedRevision),
     score: scoreFraction(item.score),
-    issues: rawIssues.map((issue) => clean(issue, 1_000)).filter(Boolean).slice(0, 50),
-    field_fixes: rawFixes.flatMap((entry) => {
-      if (!entry || typeof entry !== 'object') return [];
-      const fix = entry as Record<string, unknown>;
-      const index = Math.trunc(Number(fix.index));
-      if (!Number.isFinite(index) || index < 0) return [];
-      return [{ index, text: clean(fix.text, 3_000), support_quote: clean(fix.support_quote, 1_200) }];
-    }).slice(0, 80),
-    overview: clean(item.overview, 5_000),
+    issues,
+    operations: [...operations, ...legacyFixes].slice(0, 32),
+    overview: strictOptionalString(item.overview, 5_000),
   };
 }
+
+function normalizeRepairDelta(value: unknown): RepairDelta | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const item = value as Record<string, unknown>;
+  const baseRevision = strictOptionalString(item.base_revision, 128);
+
+  if (!baseRevision) return null;
+  const rawOperations = Array.isArray(item.operations) ? item.operations : [];
+  if (rawOperations.length > 16) return null;
+  const operations = rawOperations.map(normalizeFieldOperation);
+  if (operations.some((operation) => !operation)) return null;
+  const overview = strictOptionalString(item.overview, 5_000);
+  if (item.overview != null && !overview) return null;
+  return {
+    baseRevision,
+    operations: operations as FieldOperation[],
+    overview,
+  };
+}
+function isRepairDeltaResponse(value: unknown): value is RepairDelta {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function withFieldHandles(profile: ProfileSynthesis, seed: string): ProfileSynthesis {
+  return {
+    ...profile,
+    fields: profile.fields.map((field, index) => ({
+      ...field,
+      handle: field.handle
+        ?? `field-${sha256(`${seed}|${index}|${field.kind}|${field.text}|${field.support_quote}`).slice(0, 20)}`,
+    })),
+  };
+}
+
+function profileCandidateRevision(profile: ProfileSynthesis, sections: DerivedDocumentSection[]): string {
+  return sha256(JSON.stringify({
+    pipeline: DOCUMENT_PROFILE_PIPELINE_VERSION,
+    overview: profile.overview,
+    fields: profile.fields.map((field) => ({
+      handle: field.handle, kind: field.kind, text: field.text,
+      support_quote: field.support_quote, page: field.page,
+      confidence: field.confidence, centrality: field.centrality,
+    })),
+    sections: sections.map((section) => ({
+      id: section.sectionId, title: section.title, role: section.role, summary: section.summary,
+      concepts: section.concepts, claims: section.claims,
+    })),
+  }));
+}
+
+function sectionEvidenceInventory(
+  sections: DerivedDocumentSection[],
+  analyses: Map<string, SectionAnalysis>,
+): EvidenceHandle[] {
+  return sections.flatMap((section) => (analyses.get(section.sectionId)?.claims ?? []).map((claim, index) => ({
+    handle: `${section.sectionId}:claim:${index}`,
+    sectionId: section.sectionId,
+    quote: claim.support_quote,
+    page: claim.page,
+  })));
+}
+
+function applyRepairDelta(input: {
+  profile: ProfileSynthesis;
+  delta: RepairDelta;
+  expectedRevision: string;
+  evidence: EvidenceHandle[];
+  sections: DerivedDocumentSection[];
+}): { profile: ProfileSynthesis; changed: boolean; errors: string[] } {
+  if (input.delta.baseRevision !== input.expectedRevision) {
+    return { profile: input.profile, changed: false, errors: ['stale_revision'] };
+  }
+  const fields = input.profile.fields.map((field) => ({ ...field }));
+  const byHandle = new Map(fields.map((field) => [field.handle ?? '', field]));
+  const evidence = new Map(input.evidence.map((entry) => [entry.handle, entry]));
+  const sections = new Map(input.sections.map((section) => [section.sectionId, section]));
+  const touched = new Set<string>();
+  const errors: string[] = [];
+  let changed = false;
+
+  for (let index = 0; index < input.delta.operations.length; index += 1) {
+    const operation = input.delta.operations[index];
+    if (operation.op !== 'add_field') {
+      if (!operation.target || touched.has(operation.target)) { errors.push('conflicting_target'); continue; }
+      touched.add(operation.target);
+      if (!byHandle.has(operation.target)) { errors.push('unknown_target'); continue; }
+    }
+    if (operation.op === 'remove_field') {
+      changed = true;
+      continue;
+    }
+    const current = operation.op === 'edit_field' ? byHandle.get(operation.target ?? '') ?? null : null;
+    const kind = operation.kind ?? current?.kind ?? null;
+    const text = operation.text ?? current?.text ?? null;
+    const supportQuote = operation.supportQuote ?? current?.support_quote ?? null;
+    if (!kind || !FIELD_KINDS.has(kind) || !text || !supportQuote) {
+      errors.push('invalid_field_shape');
+      continue;
+    }
+    const quoteChanged = !current || supportQuote !== current.support_quote;
+    let pageValue = current?.page ?? null;
+    if (quoteChanged || operation.evidenceHandle) {
+      const source = operation.evidenceHandle ? evidence.get(operation.evidenceHandle) : null;
+      const section = source ? sections.get(source.sectionId) : null;
+      if (!source || !section
+        || !source.quote.includes(supportQuote)
+        || quoteOffset(section.body, supportQuote) < 0) {
+        errors.push('invalid_evidence');
+        continue;
+      }
+      pageValue = source.page ?? section.pageStart;
+    }
+    if (current) {
+      const before = { ...current };
+      Object.assign(current, {
+        kind, text, support_quote: supportQuote, page: pageValue,
+        confidence: operation.confidence ?? current.confidence,
+        centrality: operation.centrality ?? current.centrality,
+      });
+      changed = changed
+        || kind !== before.kind
+        || text !== before.text
+        || supportQuote !== before.support_quote
+        || current.confidence !== before.confidence
+        || current.centrality !== before.centrality;
+    } else {
+      if (fields.length >= 80) { errors.push('field_limit'); continue; }
+      const handle = `field-${sha256(`${input.expectedRevision}|add|${index}|${kind}|${text}|${supportQuote}`).slice(0, 20)}`;
+      const added: RawProfileField = {
+        handle, kind, text, support_quote: supportQuote, page: pageValue,
+        confidence: operation.confidence ?? DIRECT_SUPPORT_CONFIDENCE_FLOOR,
+        centrality: operation.centrality ?? 0.5,
+        confidenceSource: operation.confidence == null ? 'floor' : 'model',
+      };
+      fields.push(added);
+      byHandle.set(handle, added);
+      changed = true;
+    }
+  }
+  if (errors.length) return { profile: input.profile, changed: false, errors };
+  const removed = new Set(input.delta.operations
+    .filter((operation) => operation.op === 'remove_field' && operation.target)
+    .map((operation) => operation.target as string));
+  const overview = input.delta.overview ?? input.profile.overview;
+  changed = changed || overview !== input.profile.overview || removed.size > 0;
+  return {
+    profile: { ...input.profile, overview, fields: fields.filter((field) => !removed.has(field.handle ?? '')) },
+    changed,
+    errors: [],
+  };
+}
+
+export function applyDocumentProfileRepairDeltaForTest(input: {
+  profile: ProfileSynthesis;
+  delta: RepairDelta;
+  expectedRevision: string;
+  evidence: EvidenceHandle[];
+  sections: DerivedDocumentSection[];
+}): { profile: ProfileSynthesis; changed: boolean; errors: string[] } {
+  return applyRepairDelta(input);
+}
+
 
 function auditFailureMessage(audit: DocumentProfileAudit): string {
   const details = [
@@ -320,7 +667,7 @@ function auditFailureMessage(audit: DocumentProfileAudit): string {
  *  score cleared the acceptance bar. A missing score is not a zero: the verdict is
  *  then decided by `passed` alone, and the profile is published with its own mode. */
 function semanticApproved(verdict: AuditResponse | null): boolean {
-  if (!verdict?.passed) return false;
+  if (!verdict?.passed || verdict.issues.some((issue) => issue.blocking)) return false;
   return verdict.score == null || verdict.score >= SEMANTIC_ACCEPTANCE_SCORE;
 }
 
@@ -529,7 +876,7 @@ function mergeSectionAnalyses(values: SectionAnalysis[], fallbackTitle: string):
 }
 
 function literalSectionFallback(evidence: string, title: string): SectionAnalysis {
-  const quote = clean(evidence, 900);
+  const quote = clean(intactSourceExcerpt(evidence, 900), 900);
   const claims: RawClaim[] = quote ? [{
     text: quote,
     support_quote: quote,
@@ -545,10 +892,11 @@ async function auditSectionAnalysis(
   fallbackTitle: string,
   options: RunDocumentProfileOptions,
   splitDepth = 0,
+  initialIssues: string[] = [],
 ): Promise<SectionAnalysis> {
   let current = { ...candidate, claims: candidate.claims.filter((claim) => quoteOffset(evidence, claim.support_quote) >= 0) };
   const literalClaims = new Map(current.claims.map((claim) => [claim.support_quote, claim]));
-  let issues: string[] = [];
+  let issues: string[] = [...initialIssues];
   for (let attempt = 0; attempt < 5; attempt += 1) {
     let response: SectionAuditResponse;
     try {
@@ -571,6 +919,7 @@ async function auditSectionAnalysis(
             fallbackTitle,
             { ...options, signal: poolSignal },
             splitDepth + 1,
+            initialIssues,
           ),
           options.signal,
         );
@@ -619,7 +968,7 @@ async function analyzeSectionPart(
   options: RunDocumentProfileOptions,
   depth = 0,
 ): Promise<SectionAnalysis> {
-  const hash = sha256(evidence);
+  const hash = profileCheckpointHash(key, evidence, options);
   const cached = readDocumentCheckpoint<SectionAnalysis>(options.jobId, key, hash);
   if (cached) return cached;
   let candidate: SectionAnalysis;
@@ -680,7 +1029,7 @@ async function analyzeSection(section: DerivedDocumentSection, options: RunDocum
     return analyzeSectionPart(part, key, section.title, section.pageStart, { ...options, signal: poolSignal });
   }, options.signal);
   if (analyses.length === 1) return analyses[0];
-  const reduceHash = sha256(JSON.stringify(analyses));
+  const reduceHash = profileCheckpointHash(`section:${section.sectionId}:reduced`, analyses, options);
   const cached = readDocumentCheckpoint<SectionAnalysis>(options.jobId, `section:${section.sectionId}:reduced`, reduceHash);
   if (cached) return cached;
   let candidate: SectionAnalysis;
@@ -712,74 +1061,60 @@ async function analyzeSection(section: DerivedDocumentSection, options: RunDocum
   return reduced;
 }
 
-function collapsedLiteralText(value: string): { text: string; offsets: number[] } {
-  let text = '';
-  const offsets: number[] = [];
-  let inWhitespace = false;
-  for (let index = 0; index < value.length; index += 1) {
-    const character = value[index];
-    if (/\s/u.test(character)) {
-      if (!inWhitespace) {
-        text += ' ';
-        offsets.push(index);
-        inWhitespace = true;
-      }
-      continue;
-    }
-    const normalized = character.normalize('NFKC').toLocaleLowerCase();
-    text += normalized;
-    for (let emitted = 0; emitted < normalized.length; emitted += 1) offsets.push(index);
-    inWhitespace = false;
-  }
-  return { text, offsets };
-}
-
 function quoteOffset(text: string, quote: string): number {
-  const direct = text.toLocaleLowerCase().indexOf(quote.toLocaleLowerCase());
-  if (direct >= 0) return direct;
-  const haystack = collapsedLiteralText(text);
-  const needle = collapsedLiteralText(quote).text.trim();
-  if (!needle) return -1;
-  const normalizedOffset = haystack.text.indexOf(needle);
-  return normalizedOffset >= 0 ? (haystack.offsets[normalizedOffset] ?? -1) : -1;
+  return findLiteralSourceSpans(text, quote)[0]?.charStart ?? -1;
 }
 
-function passageForQuote(nodusId: string, quote: string, candidate: PreparedPassages | null): string | null {
-  const terms = quote.toLocaleLowerCase().split(/[^\p{L}\p{N}]+/u).filter((term) => term.length > 4).slice(0, 8);
-  if (!terms.length) return null;
-  const rows = candidate
-    ? candidate.rows.map((row, index) => ({ passage_id: `${nodusId}#${index}`, text: row.text }))
-    : getDb().prepare('SELECT passage_id,text FROM passages WHERE nodus_id=?').all(nodusId) as { passage_id: string; text: string }[];
-  let best: { id: string; score: number } | null = null;
-  for (const row of rows) {
-    const haystack = row.text.toLocaleLowerCase();
-    const score = terms.filter((term) => haystack.includes(term)).length / terms.length;
-    if (!best || score > best.score) best = { id: row.passage_id, score };
-  }
-  return best && best.score >= 0.45 ? best.id : null;
+function passageForQuote(
+  nodusId: string,
+  quote: string,
+  span: SourceTextSpan,
+  sourceRef: string | null,
+  pageNumber: number | null,
+  passages: RetrievalChunk[],
+): string | null {
+  const index = selectLiteralPassageIndex(passages, quote, span, sourceRef, pageNumber);
+  return index == null ? null : `${nodusId}#${index}`;
 }
 
 function supportForQuote(input: {
   nodusId: string; text: string; quote: string; targetKind: 'field' | 'section'; targetId: string;
   sections: DerivedDocumentSection[]; confidence: number;
-  candidatePassages: PreparedPassages | null;
+  passages: RetrievalChunk[];
   sourceMap: Record<string, string>;
 }): DocumentProfileSupport | null {
-  const offset = quoteOffset(input.text, input.quote);
-  if (offset < 0) return null;
-  const section = input.sections.find((candidate) =>
-    candidate.charStart != null && candidate.charEnd != null && offset >= candidate.charStart && offset <= candidate.charEnd
-  ) ?? null;
-  const location = parseSourceLocationAt(input.text, offset, input.sourceMap);
-  return {
-    supportId: randomUUID(), targetKind: input.targetKind, targetId: input.targetId,
-    sectionId: section?.sectionId ?? null, passageId: passageForQuote(input.nodusId, input.quote, input.candidatePassages),
-    // A provider-supplied page label is never sufficient provenance. The quote's
-    // literal offset must resolve against an extracted marker or the page stays null.
-    pageStart: location.label, pageEnd: location.label,
-    sourceRef: location.sourceRef, pageStartNumber: location.pageNumber, pageEndNumber: location.pageNumber,
-    quote: input.quote, supportKind: 'direct', confidence: input.confidence, validationStatus: 'valid',
-  };
+  const targetSection = input.targetKind === 'section'
+    ? input.sections.find((section) => section.sectionId === input.targetId) ?? null
+    : null;
+  const scope = targetSection?.charStart != null && targetSection.charEnd != null
+    ? { charStart: targetSection.charStart, charEnd: targetSection.charEnd }
+    : null;
+  const matches = findLiteralSourceSpans(input.text, input.quote, scope);
+  for (const match of matches) {
+    const start = parseSourceLocationAt(input.text, match.charStart, input.sourceMap);
+    const end = parseSourceLocationAt(input.text, Math.max(match.charStart, match.charEnd - 1), input.sourceMap);
+    // One direct support cannot cross an attachment boundary. Null is a real
+    // single-source identity here, not a wildcard for any marked source.
+    if (start.sourceRef !== end.sourceRef) continue;
+    const section = targetSection ?? input.sections.find((candidate) =>
+      candidate.charStart != null && candidate.charEnd != null
+      && match.charStart >= candidate.charStart && match.charEnd <= candidate.charEnd
+    ) ?? null;
+    return {
+      supportId: randomUUID(), targetKind: input.targetKind, targetId: input.targetId,
+      sectionId: section?.sectionId ?? null,
+      passageId: passageForQuote(
+        input.nodusId, input.quote, match, start.sourceRef, start.pageNumber, input.passages,
+      ),
+      // Provider-supplied page labels are never provenance. Both endpoints come
+      // from the selected literal occurrence in the resolved source.
+      pageStart: start.label, pageEnd: end.label,
+      sourceRef: start.sourceRef, pageStartNumber: start.pageNumber, pageEndNumber: end.pageNumber,
+      charStart: match.charStart, charEnd: match.charEnd,
+      quote: input.quote, supportKind: 'direct', confidence: input.confidence, validationStatus: 'valid',
+    };
+  }
+  return null;
 }
 
 async function preparePassages(
@@ -787,14 +1122,31 @@ async function preparePassages(
   text: string,
   options: RunDocumentProfileOptions,
   sourceMap: Record<string, string> = {},
-): Promise<PreparedPassages | null> {
+): Promise<PreparedPassages> {
   options.signal?.throwIfAborted();
   const contentHash = sha1(text);
+  const chunks = planRetrievalChunks(text, { sourceMap });
   const current = getDb().prepare(
     'SELECT COUNT(*) count, MIN(content_hash) hash FROM passages WHERE nodus_id=?'
   ).get(work.nodus_id) as { count: number; hash: string | null };
-  if (current.count > 0 && current.hash === contentHash) return null;
-  const chunks = planRetrievalChunks(text, { sourceMap });
+  if (current.count > 0 && current.hash === contentHash) {
+    const persisted = getDb().prepare(
+      `SELECT chunk_index,text,page_label,source_ref,page_number
+         FROM passages WHERE nodus_id=? ORDER BY chunk_index`
+    ).all(work.nodus_id) as Array<{
+      chunk_index: number; text: string; page_label: string | null;
+      source_ref: string | null; page_number: number | null;
+    }>;
+    const compatible = persisted.length === chunks.length && persisted.every((row, index) => {
+      const planned = chunks[index];
+      return row.chunk_index === index
+        && row.text === planned.text
+        && row.page_label === planned.pageLabel
+        && row.source_ref === planned.sourceRef
+        && row.page_number === planned.pageNumber;
+    });
+    if (compatible) return { rows: chunks, publication: null };
+  }
   const embeddingConfig = currentEmbeddingConfig();
   const embeddings = await embedMany(chunks.map((chunk) => chunk.text), options.signal, {
     perf: options.perf,
@@ -802,12 +1154,15 @@ async function preparePassages(
   });
   options.signal?.throwIfAborted();
   return {
-    contentHash,
-    embeddingProvider: embeddingConfig.provider,
-    embeddingModel: embeddingConfig.model,
-    rows: chunks.map((chunk, index) => ({
-    ...chunk, embedding: embeddings[index]?.length ? embeddings[index] : null,
-    })),
+    rows: chunks,
+    publication: {
+      contentHash,
+      embeddingProvider: embeddingConfig.provider,
+      embeddingModel: embeddingConfig.model,
+      rows: chunks.map((chunk, index) => ({
+        ...chunk, embedding: embeddings[index]?.length ? embeddings[index] : null,
+      })),
+    },
   };
 }
 
@@ -851,7 +1206,7 @@ async function synthesizeProfileAdaptive(
   splitPath = 'root',
   splitDepth = 0,
 ): Promise<ProfileSynthesis> {
-  const inputHash = sha256(JSON.stringify(input));
+  const inputHash = profileCheckpointHash(`profile:synthesis:${splitPath}`, input, options);
   const checkpointType = splitPath === 'root' ? 'profile:synthesis' : `profile:synthesis:${splitPath}`;
   const checkpoint = readDocumentCheckpoint<ProfileSynthesis>(options.jobId, checkpointType, inputHash);
   if (checkpoint) return checkpoint;
@@ -897,34 +1252,6 @@ async function synthesizeProfileAdaptive(
   }
 }
 
-/** A copy of the audit payload small enough for a provider whose answer to the full one
- *  ran out of output budget. The response has to echo the corrections it proposes
- *  (`field_fixes`, `overview`), so it can only be as large as what it was given:
- *  compacting the request is what makes the answer fit, and it keeps every field and
- *  section present so the verdict still covers the whole profile. */
-function compactAuditPayload(profile: ProfileSynthesis, sections: unknown): { profile: unknown; sections: unknown[] } {
-  const claim = (value: unknown): unknown => {
-    const record = value && typeof value === 'object' ? value as Record<string, unknown> : {};
-    return { text: clean(record.text, 200), support_quote: clean(record.support_quote, 120) };
-  };
-  return {
-    profile: {
-      ...profile,
-      overview: clean(profile.overview, 800),
-      fields: profile.fields.map((field) => ({
-        ...field, text: clean(field.text, 400), support_quote: clean(field.support_quote, 200),
-      })),
-    },
-    sections: (Array.isArray(sections) ? sections : []).map((value: unknown) => {
-      const record = value && typeof value === 'object' ? value as Record<string, unknown> : {};
-      return {
-        id: record.id, title: clean(record.title, 200), role: record.role,
-        summary: clean(record.summary, 600), page_start: record.page_start, page_end: record.page_end,
-        claims: (Array.isArray(record.claims) ? record.claims : []).slice(0, 4).map(claim),
-      };
-    }),
-  };
-}
 
 function deterministicAudit(text: string, sections: DerivedDocumentSection[], profile: ProfileSynthesis): {
   supportCoverage: number; structureCoverage: number; supportedFields: RawProfileField[];
@@ -988,7 +1315,7 @@ function buildExtractiveProfileFallback(
         confidence: DIRECT_SUPPORT_CONFIDENCE_FLOOR,
       }));
     if (!claims.length) {
-      const literal = clean(section.body, 900);
+      const literal = clean(intactSourceExcerpt(section.body, 900), 900);
       if (literal) claims = [{
         text: literal,
         support_quote: literal,
@@ -1040,7 +1367,10 @@ function alignIdeas(nodusId: string, vectors: Array<{ sourceId: string; kind: st
     const ideaVector = decodeEmbedding(idea.embedding);
     let best: { target: typeof vectors[number]; score: number } | null = null;
     for (const vector of vectors) {
-      if (!vector.embedding?.length) continue;
+      // DocumentIdeaLink can target only a materialized field or section. The
+      // overview remains useful for document retrieval but has no persistent
+      // target row, so aligning an idea to it would create a dangling link.
+      if (vector.kind === 'overview' || !vector.embedding?.length) continue;
       const score = cosineSimilarity(ideaVector, vector.embedding);
       if (!best || score > best.score) best = { target: vector, score };
     }
@@ -1085,6 +1415,22 @@ function emit(
   }
 }
 
+function materializeSectionAnalysis(
+  section: DerivedDocumentSection,
+  analysis: SectionAnalysis,
+): DerivedDocumentSection {
+  return {
+    // A heading-less chunk intentionally keeps its generated title only after
+    // analysis; the UI localizes a truly untitled section.
+    ...section,
+    title: section.title || analysis.title,
+    role: analysis.role || null,
+    summary: analysis.summary,
+    concepts: analysis.concepts,
+    claims: analysis.claims.map((claim) => claim.text),
+  };
+}
+
 /** Full-text, hierarchical, audited document scan. */
 export async function runDocumentProfileScan(work: Work, options: RunDocumentProfileOptions): Promise<string> {
   const scanStartedAt = Date.now();
@@ -1126,8 +1472,11 @@ export async function runDocumentProfileScan(work: Work, options: RunDocumentPro
   setResolvedTextState(work.nodus_id, resolvedTextStateFromDoc(document));
   options.signal?.throwIfAborted();
   if (!document.text.trim() || document.sourceType === 'none' || document.sourceType === 'abstract_only') {
-    setDocumentProfileState(work.nodus_id, 'unavailable', { error: document.notes ?? 'No hay texto completo legible' });
-    throw new Error(document.notes ?? 'No hay texto completo legible');
+    throw new DocumentSourceUnavailableError(
+      document.notes ?? 'No hay texto completo legible',
+      document.sourceType,
+      document.blockReason ?? null,
+    );
   }
   const sourceFingerprint = sha256(document.text);
   const sourceContentHash = sha1(document.text);
@@ -1162,18 +1511,10 @@ export async function runDocumentProfileScan(work: Work, options: RunDocumentPro
   for (let index = 0; index < sections.length; index += 1) {
     const analysis = orderedAnalyses[index];
     sectionAnalyses.set(sections[index].sectionId, analysis);
-    sections[index] = {
-      // A chunk of a document without headings has no real title. It is kept empty
-      // on purpose: anything stored here becomes user-visible data, is fed back as
-      // `section_title` for the model to echo, and would ship in whatever language
-      // the placeholder was written in. The UI localizes an untitled section.
-      ...sections[index], title: sections[index].title || analysis.title,
-      role: analysis.role || null, summary: analysis.summary, concepts: analysis.concepts,
-      claims: analysis.claims.map((claim) => claim.text),
-    };
+    sections[index] = materializeSectionAnalysis(sections[index], analysis);
   }
 
-  const synthesisInput = synthesisPayload(work, sections, sectionAnalyses, item?.abstract ?? null);
+  let synthesisInput = synthesisPayload(work, sections, sectionAnalyses, item?.abstract ?? null);
   emit(options, 'synthesizing', 0.64, 'Sintetizando la obra completa…');
   let profile: ProfileSynthesis;
   let extractiveFallback = false;
@@ -1200,112 +1541,293 @@ export async function runDocumentProfileScan(work: Work, options: RunDocumentPro
   }
   repaired = repaired || profile.fields.length !== initialFieldCount;
 
+  profile = withFieldHandles(profile, sourceFingerprint);
   let auditor: AuditResponse | null = null;
-  let compactAudit = false;
-  // Why no verdict could be obtained, when that is what happened. It travels with the
-  // audit issues so the user learns the model could not hold the profile instead of
-  // getting a work that simply failed.
   let auditFailureNote: string | null = null;
   let deterministic = deterministicAudit(document.text, sections, profile);
-  const auditPack = documentProfilePromptPack(options.language ?? getSettings().promptLanguage ?? 'es').audit;
-  const requestAudit = async (compact: boolean, attempt: number): Promise<AuditResponse> => {
-    const sections = Array.isArray(synthesisInput.sections) ? synthesisInput.sections : [];
-    const withDeterministic = (body: { profile: unknown; sections: unknown[] }) => ({ ...body, deterministic: {
-      support_coverage: deterministic.supportCoverage, structure_coverage: deterministic.structureCoverage,
-    } });
-    const full = withDeterministic({ profile, sections });
-    // A prompt that cannot fit the loaded window fails before it can be truncated, so the
-    // compact projection is used from the start when the full one is too large for it. Its
-    // smaller echo is also what keeps the answer inside the output ceiling.
-    const useCompact = compact || !promptFits(auditPack, full, options.auditorTokenBudget);
-    const body = useCompact ? withDeterministic(compactAuditPayload(profile, sections)) : full;
-    return normalizeDocumentProfileAuditResponse(await completeJson<AuditResponse>({
-      system: auditPack,
-      user: JSON.stringify(body),
-      temperature: 0, maxTokens: 5_000, signal: options.signal,
-      requestClass: 'background', jobId: `${options.jobId}:profile:audit:${attempt}:${useCompact ? 'compact' : 'full'}`,
-      perf: options.perf,
-    }, isAuditResponse, options.auditorModel));
+  let auditedRevision: string | null = null;
+  let repairDispatches = 0;
+  const seenCandidateRevisions = new Set<string>();
+  const promptPack = documentProfilePromptPack(options.language ?? getSettings().promptLanguage ?? 'es');
+
+  const mergeAudits = (revision: string, responses: AuditResponse[]): AuditResponse => {
+    const scores = responses.map((response) => response.score).filter((score): score is number => score != null);
+    const overviews = [...new Set(responses.map((response) => response.overview).filter((value): value is string => !!value))];
+    const issues = responses.flatMap((response) => response.issues);
+    if (overviews.length > 1) issues.push({
+      code: 'conflicting_overview_fixes',
+      blocking: true,
+      target: { kind: 'overview', handle: null },
+      explanation: 'Audit batches proposed conflicting overview replacements.',
+    });
+    return {
+      candidateRevision: revision,
+      passed: responses.length > 0 && responses.every((response) => response.passed),
+      score: scores.length ? Math.min(...scores) : null,
+      issues,
+      operations: responses.flatMap((response) => response.operations),
+      overview: overviews[0] ?? null,
+    };
   };
-  for (let attempt = 0; !extractiveFallback && attempt < 3; attempt += 1) {
-    emit(options, attempt === 0 ? 'auditing' : 'repairing', 0.7 + attempt * 0.05,
-      attempt === 0 ? 'Auditando la ficha contra el texto…' : `Reparando la ficha (${attempt}/2)…`);
+
+  const requestAuditUnit = async (
+    body: Record<string, unknown>,
+    revision: string,
+    attempt: number,
+    label: string,
+  ): Promise<AuditResponse> => normalizeDocumentProfileAuditResponse(await completeJson<AuditResponse>({
+    system: promptPack.audit,
+    user: JSON.stringify(body),
+    temperature: 0,
+    maxTokens: 3_000,
+    signal: options.signal,
+    requestClass: 'background',
+    jobId: `${options.jobId}:profile:audit:${attempt}:${label}`,
+    perf: options.perf,
+  }, isAuditResponse, options.auditorModel), revision, profile.fields.map((field) => field.handle ?? ''));
+
+  const requestAudit = async (attempt: number, forceBatches = false): Promise<AuditResponse> => {
+    const revision = profileCandidateRevision(profile, sections);
+    const sectionPayloads = Array.isArray(synthesisInput.sections) ? synthesisInput.sections : [];
+    const evidence = sectionEvidenceInventory(sections, sectionAnalyses);
+    const deterministicPayload = {
+      support_coverage: deterministic.supportCoverage,
+      structure_coverage: deterministic.structureCoverage,
+    };
+    const full = {
+      candidate_revision: revision,
+      profile,
+      sections: sectionPayloads,
+      evidence,
+      deterministic: deterministicPayload,
+    };
+    if (!forceBatches && promptFits(promptPack.audit, full, options.auditorTokenBudget)) {
+      return requestAuditUnit(full, revision, attempt, 'full');
+    }
+
+    const responses: AuditResponse[] = [];
+    const includedFields = new Set<string>();
+    for (let index = 0; index < sections.length; index += 1) {
+      const section = sections[index];
+      const claims = sectionAnalyses.get(section.sectionId)?.claims ?? [];
+      const fields = profile.fields.filter((field) => claims.some((claim) => claim.support_quote.includes(field.support_quote)));
+      fields.forEach((field) => includedFields.add(field.handle ?? ''));
+      const body = {
+        candidate_revision: revision,
+        mode: 'complete_section_unit',
+        profile: { ...profile, fields },
+        sections: [sectionPayloads[index]],
+        evidence: evidence.filter((entry) => entry.sectionId === section.sectionId),
+        deterministic: deterministicPayload,
+      };
+      if (!promptFits(promptPack.audit, body, options.auditorTokenBudget)) {
+        throw new AiError('La unidad completa de auditoría no cabe en el contexto del modelo.', false, true, 'context_overflow');
+      }
+      responses.push(await requestAuditUnit(body, revision, attempt, `section-${index}`));
+    }
+    const remaining = profile.fields.filter((field) => !includedFields.has(field.handle ?? ''));
+    if (remaining.length) {
+      const body = {
+        candidate_revision: revision,
+        mode: 'complete_unassigned_fields',
+        profile: { ...profile, fields: remaining },
+        sections: [],
+        evidence,
+        deterministic: deterministicPayload,
+      };
+      if (!promptFits(promptPack.audit, body, options.auditorTokenBudget)) {
+        throw new AiError('Los campos completos sin sección no caben en el contexto del modelo.', false, true, 'context_overflow');
+      }
+      responses.push(await requestAuditUnit(body, revision, attempt, 'unassigned'));
+    }
+    const global = {
+      candidate_revision: revision,
+      mode: 'global_consistency_and_omission',
+      profile,
+      sections: sectionPayloads,
+      deterministic: deterministicPayload,
+    };
+    if (!promptFits(promptPack.audit, global, options.auditorTokenBudget)) {
+      throw new AiError('La comprobación global completa no cabe en el contexto del modelo.', false, true, 'context_overflow');
+    }
+    responses.push(await requestAuditUnit(global, revision, attempt, 'global'));
+    return mergeAudits(revision, responses);
+  };
+
+  const requestRepairDelta = async (
+    issues: AuditIssue[],
+    revision: string,
+    depth = 0,
+  ): Promise<RepairDelta | null> => {
+    if (!issues.length || repairDispatches >= 8) return null;
+    const fieldHandles = new Set(issues
+      .filter((issue) => issue.target.kind === 'field' && issue.target.handle)
+      .map((issue) => issue.target.handle as string));
+    const sectionHandles = new Set(issues
+      .filter((issue) => ['section', 'claim'].includes(issue.target.kind) && issue.target.handle)
+      .map((issue) => String(issue.target.handle).split(':claim:')[0]));
+    const evidence = sectionEvidenceInventory(sections, sectionAnalyses)
+      .filter((entry) => !sectionHandles.size || sectionHandles.has(entry.sectionId));
+    const body = {
+      base_revision: revision,
+      issues,
+      overview: issues.some((issue) => issue.target.kind === 'overview') ? profile.overview : undefined,
+      fields: profile.fields.filter((field) => fieldHandles.has(field.handle ?? '')),
+      evidence,
+    };
+    repairDispatches += 1;
     try {
-      auditor = await requestAudit(compactAudit, attempt);
+      const raw = await completeJson<RepairDelta>({
+        system: promptPack.deltaRepair,
+        user: JSON.stringify(body),
+        temperature: 0,
+        maxTokens: issues.length === 1 ? 2_000 : 3_000,
+        signal: options.signal,
+        requestClass: 'background',
+        jobId: `${options.jobId}:profile:delta:${repairDispatches}`,
+        perf: options.perf,
+      }, isRepairDeltaResponse, options.generatorModel);
+      const delta = normalizeRepairDelta(raw);
+      return delta?.baseRevision === revision ? delta : null;
     } catch (error) {
       if (!recoverablePromptFailure(error)) throw error;
-      // A response that ran out of output budget is not a verdict. Replaying the same
-      // request reproduces it, so retry once with the compact payload instead: one
-      // truncated audit used to end the loop here and hand the whole synthesis to the
-      // extractive fallback. Once the full payload has overflowed it is not tried
-      // again for this profile, which would truncate the same way.
-      if (compactAudit) { auditFailureNote = describeFailure(error); break; }
-      compactAudit = true;
+      if (issues.length > 1 && depth < 4) {
+        const middle = Math.ceil(issues.length / 2);
+        const left = await requestRepairDelta(issues.slice(0, middle), revision, depth + 1);
+        const right = await requestRepairDelta(issues.slice(middle), revision, depth + 1);
+        if (!left && !right) return null;
+        return {
+          baseRevision: revision,
+          operations: [...(left?.operations ?? []), ...(right?.operations ?? [])],
+          overview: left?.overview ?? right?.overview ?? null,
+        };
+      }
+      if (issues.length === 1 && depth === 0) return requestRepairDelta(issues, revision, 1);
+      return null;
+    }
+  };
+
+  for (let attempt = 0; !extractiveFallback && attempt < 4; attempt += 1) {
+    const revision = profileCandidateRevision(profile, sections);
+    if (seenCandidateRevisions.has(revision)) {
+      auditFailureNote = 'La reparación no cambió la revisión candidata.';
+      break;
+    }
+    seenCandidateRevisions.add(revision);
+    emit(options, attempt === 0 ? 'auditing' : 'repairing', 0.7 + Math.min(attempt, 2) * 0.05,
+      attempt === 0 ? 'Auditando la ficha contra el texto…' : `Reparando la ficha (${attempt}/3)…`);
+    try {
+      auditor = await requestAudit(attempt);
+      auditedRevision = revision;
+    } catch (error) {
+      if (!recoverablePromptFailure(error)) throw error;
       try {
-        auditor = await requestAudit(true, attempt);
-      } catch (retryError) {
-        if (!recoverablePromptFailure(retryError)) throw retryError;
-        auditFailureNote = describeFailure(retryError);
+        auditor = await requestAudit(attempt, true);
+        auditedRevision = revision;
+      } catch (batchedError) {
+        if (!recoverablePromptFailure(batchedError)) throw batchedError;
+        auditFailureNote = describeFailure(batchedError);
+        auditor = null;
         break;
       }
     }
-    // Corrections are actionable whether or not the verdict was positive: an auditor
-    // that rejects the profile and says exactly which field is wrong and how to fix it
-    // was previously ignored, which forced a full re-synthesis instead of applying the
-    // fix — and often ended in the literal fallback with the fix unused.
-    if (auditor.field_fixes?.length) {
-      for (const fix of auditor.field_fixes) {
-        const target = profile.fields[Math.trunc(Number(fix.index))];
-        if (!target) continue;
-        const fixedText = clean(fix.text, 3_000);
-        const fixedQuote = clean(fix.support_quote, 1_200);
-        if (fixedQuote && quoteOffset(document.text, fixedQuote) < 0) continue;
-        if (fixedText) target.text = fixedText;
-        // A semantic auditor may suggest a polished/paraphrased quote even when
-        // its verdict is positive. Never let such a suggestion cross the
-        // deterministic literal-support boundary.
-        if (fixedQuote) target.support_quote = fixedQuote;
+
+    let changed = false;
+    const directDelta: RepairDelta = {
+      baseRevision: revision,
+      operations: auditor.operations,
+      overview: auditor.overview,
+    };
+    if (directDelta.operations.length || directDelta.overview) {
+      const applied = applyRepairDelta({
+        profile, delta: directDelta, expectedRevision: revision,
+        evidence: sectionEvidenceInventory(sections, sectionAnalyses), sections,
+      });
+      if (applied.errors.length) {
+        auditFailureNote = `La reparación propuesta no superó la validación: ${applied.errors.join(', ')}.`;
+        break;
       }
-      if (clean(auditor.overview, 5_000)) profile.overview = clean(auditor.overview, 5_000);
-      profile = retainLiterallySupportedFields(document.text, profile);
+      profile = applied.profile;
+      changed = applied.changed;
+    }
+
+    const sectionIssues = auditor.issues.filter((issue) =>
+      issue.blocking && ['section', 'claim'].includes(issue.target.kind) && issue.target.handle
+    );
+    const issuesBySection = new Map<string, string[]>();
+    for (const issue of sectionIssues) {
+      const sectionId = String(issue.target.handle).split(':claim:')[0];
+      issuesBySection.set(sectionId, [...(issuesBySection.get(sectionId) ?? []), issue.explanation]);
+    }
+    for (const [sectionId, issues] of [...issuesBySection].slice(0, 4)) {
+      const index = sections.findIndex((section) => section.sectionId === sectionId);
+      const current = sectionAnalyses.get(sectionId);
+      if (index < 0 || !current) continue;
+      const next = await auditSectionAnalysis(sections[index].body, current, sections[index].title, options, 0, issues);
+      if (JSON.stringify(next) !== JSON.stringify(current)) {
+        sectionAnalyses.set(sectionId, next);
+        sections[index] = materializeSectionAnalysis(sections[index], next);
+        changed = true;
+      }
+    }
+
+    if (!changed && !auditor.passed) {
+      const repairable = auditor.issues.filter((issue) =>
+        issue.blocking && ['field', 'overview'].includes(issue.target.kind)
+      );
+      const delta = await requestRepairDelta(repairable, revision);
+      if (delta) {
+        const applied = applyRepairDelta({
+          profile, delta, expectedRevision: revision,
+          evidence: sectionEvidenceInventory(sections, sectionAnalyses), sections,
+        });
+        if (!applied.errors.length) {
+          profile = applied.profile;
+          changed = applied.changed;
+        } else {
+          auditFailureNote = `La reparación dirigida no superó la validación: ${applied.errors.join(', ')}.`;
+        }
+      }
+    }
+
+    if (changed) {
       repaired = true;
+      synthesisInput = synthesisPayload(work, sections, sectionAnalyses, item?.abstract ?? null);
+      const retainedCount = profile.fields.length;
+      profile = retainLiterallySupportedFields(document.text, profile);
+      if (profile.fields.length !== retainedCount) repaired = true;
+      if (!profile.fields.length) break;
       deterministic = deterministicAudit(document.text, sections, profile);
+      auditor = null;
+      auditedRevision = null;
+      continue;
     }
-    if (semanticApproved(auditor) && deterministic.supportCoverage >= 0.95 && deterministic.structureCoverage >= 0.95) break;
-    if (attempt >= 2) break;
-    try {
-      profile = normalizeProfile(await completeJson<ProfileSynthesis>({
-        system: documentProfilePromptPack(options.language ?? getSettings().promptLanguage ?? 'es').repair,
-        user: JSON.stringify({ profile, audit: auditor, sections: synthesisInput.sections }),
-        temperature: 0, maxTokens: 8_000, signal: options.signal,
-        requestClass: 'background', jobId: `${options.jobId}:profile:repair:${attempt}`,
-        perf: options.perf,
-      }, isProfileSynthesis, options.generatorModel));
-    } catch (error) {
-      if (!recoverablePromptFailure(error)) throw error;
-      break;
-    }
-    const repairedFieldCount = profile.fields.length;
-    profile = retainLiterallySupportedFields(document.text, profile);
-    repaired = true;
-    if (!profile.fields.length) break;
-    if (profile.fields.length !== repairedFieldCount) repaired = true;
     deterministic = deterministicAudit(document.text, sections, profile);
+    break;
+  }
+  const finalRevision = profileCandidateRevision(profile, sections);
+  if (auditor && auditedRevision !== finalRevision) {
+    auditFailureNote = 'La revisión final difiere de la revisión auditada.';
+    auditor = null;
   }
   const deterministicComplete = deterministic.supportCoverage === 1 && deterministic.structureCoverage >= 0.95;
   const approved = semanticApproved(auditor);
-  // The synthesis is kept whenever the deterministic evidence contract holds, because
-  // retention has already left every published field carrying a literal support: a low
-  // semantic score says the auditor disliked the prose, not that the evidence is
-  // unsupported. Discarding the whole synthesis over a hundredth of a point replaced an
-  // audited profile with a list of raw quotations, which orients retrieval worse.
+  // Keep a synthesis as `partial` only when the auditor explicitly approved its
+  // semantics but the numeric score missed the preferred acceptance bar. A rejected
+  // claim is not made safe merely because its quoted words occur somewhere in the
+  // source; explicit rejection therefore degrades to literal extraction below.
   let mode: DocumentProfileFallbackMode | null = null;
   let publishable = false;
   let auditPassed = false;
   if (approved && deterministicComplete) {
     publishable = true;
     auditPassed = true;
-  } else if (!extractiveFallback && deterministicComplete && profile.fields.length > 0) {
+  } else if (
+    !extractiveFallback
+    && auditor?.passed === true
+    && deterministicComplete
+    && profile.fields.length > 0
+  ) {
     mode = 'partial';
     publishable = true;
     repaired = true;
@@ -1322,38 +1844,30 @@ export async function runDocumentProfileScan(work: Work, options: RunDocumentPro
     }
     mode = 'extractive';
     // A literal profile is fully supported by construction, so it satisfies the
-    // deterministic contract; `fallback` is what tells consumers it is not a synthesis.
+    // deterministic contract; `fallback` is what tells consumers it is publishable
+    // without pretending the semantic auditor approved a synthesis.
     publishable = deterministic.supportCoverage === 1 && deterministic.structureCoverage >= 0.95;
-    auditPassed = publishable;
-    // The marker travels with the audit whichever way the fallback was reached, so a
-    // degraded profile stays identifiable in the stored record and not only through
-    // the `fallback` field.
-    auditor = {
-      passed: auditPassed,
-      // The semantic verdict is kept as it was reported. Replacing it with the
-      // direct-support floor made a rejected synthesis and a perfect one report the
-      // same number, which is how an extractive fallback came to read "80 %".
-      score: auditor?.score ?? null,
-      issues: ['fallback_extractivo_determinista', ...strings(auditor?.issues, 20)],
-      field_fixes: [],
-      overview: profile.overview,
-    };
   }
   // How much of the published profile is quotation rather than synthesis. A profile can
   // be approved as a whole while individual sections were degraded, and nothing else in
   // the record would say so.
   const sectionsDegraded = [...sectionAnalyses.values()].filter((analysis) => analysis.degraded).length;
   const audit: DocumentProfileAudit = {
-    passed: auditPassed, score: auditor?.score ?? null, supportCoverage: deterministic.supportCoverage,
+    passed: auditPassed,
+    score: auditor?.score ?? null,
+    supportCoverage: deterministic.supportCoverage,
     structureCoverage: deterministic.structureCoverage,
-    issues: [...strings(auditor?.issues, 50), ...(auditFailureNote ? [auditFailureNote] : [])],
-    repaired: repaired || Boolean(auditor && (auditor.field_fixes?.length || auditor.overview)),
-    fallback: mode, sectionsDegraded,
+    issues: [
+      ...(mode === 'extractive' ? ['fallback_extractivo_determinista'] : []),
+      ...(auditor?.issues.map((issue) => issue.explanation) ?? []),
+      ...(auditFailureNote ? [auditFailureNote] : []),
+    ].slice(0, 50),
+    repaired: repaired || Boolean(auditor && (auditor.operations.length || auditor.overview)),
+    fallback: mode,
+    sectionsDegraded,
   };
   if (!publishable) {
-    const error = auditFailureMessage(audit);
-    setDocumentProfileState(work.nodus_id, 'failed', { sourceFingerprint, pipelineVersion: DOCUMENT_PROFILE_PIPELINE_VERSION, error });
-    throw new Error(error);
+    throw new DocumentProfilePublicationError(auditFailureMessage(audit));
   }
 
   const fields = deterministic.supportedFields.map((field, index) => ({
@@ -1367,7 +1881,7 @@ export async function runDocumentProfileScan(work: Work, options: RunDocumentPro
     const support = supportForQuote({
       nodusId: work.nodus_id, text: document.text, quote: field.support_quote, targetKind: 'field',
       targetId: fields[index].fieldId, sections, confidence: field.confidence,
-      candidatePassages: preparedPassages, sourceMap,
+      passages: preparedPassages.rows, sourceMap,
     });
     if (support) supports.push(support);
   });
@@ -1378,7 +1892,7 @@ export async function runDocumentProfileScan(work: Work, options: RunDocumentPro
     const support = supportForQuote({
       nodusId: work.nodus_id, text: document.text, quote, targetKind: 'section', targetId: section.sectionId,
       sections, confidence: analysis.claims[0].confidence,
-      candidatePassages: preparedPassages, sourceMap,
+      passages: preparedPassages.rows, sourceMap,
     });
     if (support) supports.push(support);
   }
@@ -1425,12 +1939,19 @@ export async function runDocumentProfileScan(work: Work, options: RunDocumentPro
     || sha256(latestDocument.text) !== sourceFingerprint) {
     throw new Error('DOCUMENT_SOURCE_CHANGED');
   }
+  const profileForPublication = {
+    ...profile,
+    fields: profile.fields.map(({ handle: _handle, ...field }) => field),
+    metadata: synthesisInput.metadata,
+    fallbackMode: mode,
+  };
   const versionId = publishDocumentProfile({
     nodusId: work.nodus_id, sourceFingerprint, pipelineVersion: DOCUMENT_PROFILE_PIPELINE_VERSION,
     schemaVersion: DOCUMENT_PROFILE_SCHEMA_VERSION, sourceLanguage: profile.source_language,
     presentationLanguage: settings.promptLanguage, overview: profile.overview,
-    profile: { ...profile, metadata: synthesisInput.metadata, fallbackMode: mode }, fields,
+    profile: profileForPublication, fields,
     sections: sections.map(({ body: _body, ...section }) => section), supports, ideaLinks,
+    resolvedText: latestDocument.text,
     vectors, generatorModel: options.generatorModel, auditorModel: options.auditorModel,
     promptHash: sha256(JSON.stringify(documentProfilePromptPack(options.language ?? settings.promptLanguage ?? 'es'))), audit,
     // Quality is the lowest of the readings, and only exists when the auditor actually
@@ -1438,7 +1959,9 @@ export async function runDocumentProfileScan(work: Work, options: RunDocumentPro
     // gate requires (so they would read as a perfect score) and the profile already
     // says it was not approved; reporting "100 %" beside that caveat would be worse
     // than reporting nothing.
-    qualityScore: audit.score == null ? null : Math.min(audit.score, audit.supportCoverage, audit.structureCoverage),
+    qualityScore: mode === 'extractive' || audit.score == null
+      ? null
+      : Math.min(audit.score, audit.supportCoverage, audit.structureCoverage),
     expectedWorkRevision: {
       zoteroKey: work.zotero_key,
       zoteroVersion: work.zotero_version,
@@ -1450,7 +1973,7 @@ export async function runDocumentProfileScan(work: Work, options: RunDocumentPro
       deepHash: work.deep_hash,
       resolvedTextHash: sourceContentHash,
     },
-    passages: preparedPassages,
+    passages: preparedPassages.publication,
   });
   // The one green line per indexed document. It carries the numbers a reader cannot get
   // back afterwards — how many sections were extracted and how many vectors were published

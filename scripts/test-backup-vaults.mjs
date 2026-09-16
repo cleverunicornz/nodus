@@ -48,7 +48,7 @@ try {
   assert.ok(entities.getPerson(alice.personId), 'person seeded in vault A');
   const documentProfiles = require(path.join(repoRoot, 'electron/db/documentProfilesRepo.ts'));
   getDb().prepare("INSERT INTO works(nodus_id,zotero_key,title) VALUES('backup-doc','BACKUP-DOC','Obra con perfil')").run();
-  documentProfiles.publishDocumentProfile({
+  const backupProfileVersion = documentProfiles.publishDocumentProfile({
     nodusId: 'backup-doc', sourceFingerprint: 'backup-source', pipelineVersion: 'document-profile/1', schemaVersion: 1,
     sourceLanguage: 'es', presentationLanguage: 'es', overview: 'Perfil que debe sobrevivir al backup.', profile: {},
     fields: [{ fieldId: 'backup-field', kind: 'thesis', ordinal: 0, text: 'Tesis preservada.', confidence: 1, centrality: 1 }],
@@ -197,7 +197,7 @@ try {
   assert.ok(entities.getPerson(alice.personId), 'Alice restored in the academic vault');
   assert.equal(documentProfiles.getDocumentProfile('backup-doc').fields[0].text, 'Tesis preservada.', 'the audited document profile is restored');
   assert.equal(
-    getDb().prepare("SELECT length(embedding) AS bytes FROM document_vectors WHERE vector_id='backup-vector'").get().bytes,
+    getDb().prepare("SELECT length(embedding) AS bytes FROM document_vectors WHERE version_id=? AND kind='overview'").get(backupProfileVersion).bytes,
     16,
     'the document embedding is restored without reindexing'
   );

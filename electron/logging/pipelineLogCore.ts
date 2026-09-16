@@ -395,6 +395,10 @@ export function classifyPipelineError(error: unknown, fallbackCategory: Pipeline
     };
   }
 
+  if (readString(error, 'name') === 'SqliteError' || explicitCode?.toUpperCase().startsWith('SQLITE_')) {
+    return { code: 'db_error', category: 'storage', detail, retriable: false, httpStatus: status, stack };
+  }
+
   const errno = readString(error, 'errno') ?? readString(error, 'code');
   if (errno && CONNECTION_ERRNOS.has(errno.toUpperCase())) {
     return { code: 'connection', category: 'connection', detail, retriable: retriable ?? true, httpStatus: status, stack };

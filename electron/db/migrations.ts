@@ -75,15 +75,20 @@ function ensureZoteroFingerprintColumn(db: Database.Database): void {
   db.exec(`
     DROP TRIGGER IF EXISTS works_document_profile_stale_deep;
     CREATE TRIGGER works_document_profile_stale_deep
-    AFTER UPDATE OF deep_hash, zotero_version, zotero_fingerprint ON works
+    AFTER UPDATE OF deep_hash, zotero_version, zotero_fingerprint, resolved_text_hash ON works
     WHEN OLD.deep_hash IS NOT NEW.deep_hash
       OR OLD.zotero_version IS NOT NEW.zotero_version
       OR (OLD.zotero_fingerprint IS NOT NULL AND OLD.zotero_fingerprint IS NOT NEW.zotero_fingerprint)
+      OR OLD.resolved_text_hash IS NOT NEW.resolved_text_hash
     BEGIN
       UPDATE document_profile_state
          SET status='stale', stale_reason='source_changed', error=NULL,
              updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
        WHERE nodus_id=NEW.nodus_id AND current_version_id IS NOT NULL;
+      UPDATE library_analysis_freshness
+         SET freshness='stale', reason='resolved_source_changed',
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE work_id=NEW.nodus_id AND component IN ('passages','documentProfile');
     END;
   `);
 }
@@ -119,7 +124,7 @@ function ensureZoteroTitleMarkupColumn(db: Database.Database): void {
 
 // Versioned, append-only migrations. Never edit an existing migration's SQL once
 // shipped — add a new one. The current schema version is the highest applied.
-export const SCHEMA_VERSION = 177;
+export const SCHEMA_VERSION = 180;
 
 export const migrations: Migration[] = [
   {
@@ -9312,6 +9317,105 @@ export const migrations: Migration[] = [
   // deterministic direct-support floor standing in for a missing measurement.
   // Rows written before this column read as 'model', which is what they were.
   { version: 177, up: `ALTER TABLE document_profile_fields ADD COLUMN confidence_source TEXT;` },
+  // A failed refresh still leaves its last committed profile readable. Older builds
+  // marked the public state as failed even though current_version_id remained valid.
+  // Job history retains the failure; heal only the profile-facing state.
+  {
+    version: 178,
+    up: `
+      UPDATE document_profile_state
+         SET status=CASE WHEN stale_reason IS NULL THEN 'current' ELSE 'stale' END,
+             error=NULL
+       WHERE status='failed' AND current_version_id IS NOT NULL;
+      UPDATE document_profile_state
+         SET status='unavailable'
+       WHERE status='failed' AND current_version_id IS NULL
+         AND (lower(COALESCE(error,'')) LIKE '%abstract%' OR lower(COALESCE(error,'')) LIKE '%sin texto%');
+    `,
+  },
+  // Correct v178 using referential and structured source state rather than error prose.
+  // This migration intentionally also runs for databases where v178 already committed.
+  {
+    version: 179,
+    up: `
+      UPDATE document_profile_state
+         SET current_version_id=NULL,
+             status='failed',
+             error='INVALID_CURRENT_PROFILE_POINTER',
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE current_version_id IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM document_profile_versions version
+            WHERE version.version_id=document_profile_state.current_version_id
+              AND version.nodus_id=document_profile_state.nodus_id
+              AND version.state='current'
+         );
+
+      UPDATE document_profile_state
+         SET status=CASE WHEN stale_reason IS NULL THEN 'current' ELSE 'stale' END,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE status='failed' AND current_version_id IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM document_profile_versions version
+            WHERE version.version_id=document_profile_state.current_version_id
+              AND version.nodus_id=document_profile_state.nodus_id
+              AND version.state='current'
+         );
+
+      UPDATE document_profile_state
+         SET status='unavailable',
+             error=COALESCE(error,(
+               SELECT works.resolved_text_notes FROM works
+                WHERE works.nodus_id=document_profile_state.nodus_id
+             ),'No hay texto completo legible.'),
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE current_version_id IS NULL
+         AND EXISTS (
+           SELECT 1 FROM works
+            WHERE works.nodus_id=document_profile_state.nodus_id
+              AND (
+                works.resolved_source_type IN ('abstract_only','none')
+                OR works.text_block_reason IN (
+                  'abstract_only','no_attachment','file_missing','unreadable',
+                  'ocr_disabled','ocr_unavailable','zotero_unavailable'
+                )
+              )
+         );
+
+      UPDATE document_profile_state
+         SET status='failed',
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE current_version_id IS NULL AND status='unavailable'
+         AND EXISTS (
+           SELECT 1 FROM works
+            WHERE works.nodus_id=document_profile_state.nodus_id
+              AND works.resolved_source_type NOT IN ('abstract_only','none')
+              AND works.text_block_reason IS NULL
+         );
+    `,
+  },
+  {
+    version: 180,
+    up: `
+      DROP TRIGGER IF EXISTS works_document_profile_stale_deep;
+      CREATE TRIGGER works_document_profile_stale_deep
+      AFTER UPDATE OF deep_hash, zotero_version, zotero_fingerprint, resolved_text_hash ON works
+      WHEN OLD.deep_hash IS NOT NEW.deep_hash
+        OR OLD.zotero_version IS NOT NEW.zotero_version
+        OR (OLD.zotero_fingerprint IS NOT NULL AND OLD.zotero_fingerprint IS NOT NEW.zotero_fingerprint)
+        OR OLD.resolved_text_hash IS NOT NEW.resolved_text_hash
+      BEGIN
+        UPDATE document_profile_state
+           SET status='stale', stale_reason='source_changed', error=NULL,
+               updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE nodus_id=NEW.nodus_id AND current_version_id IS NOT NULL;
+        UPDATE library_analysis_freshness
+           SET freshness='stale', reason='resolved_source_changed',
+               updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE work_id=NEW.nodus_id AND component IN ('passages','documentProfile');
+      END;
+    `,
+  },
 ];
 
 /**
